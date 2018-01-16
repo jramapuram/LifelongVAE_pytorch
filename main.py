@@ -6,6 +6,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 
 from torch.autograd import Variable
+from copy import deepcopy
 
 from models.vae import VAE
 from models.student_teacher import StudentTeacher
@@ -175,7 +176,7 @@ def test(epoch, model, data_loader, grapher):
 def get_model_and_loader():
     ''' helper to return the model and the loader '''
     # we build 10 samplers as all of the below have 10 classes
-    samplers = [lambda x: ClassSampler(x, class_number=i) for i in range(10)]
+    samplers = [lambda x, i=i: ClassSampler(x, class_number=i) for i in range(10)]
 
     if args.task == 'cifar10':
         loaders = [CIFAR10Loader(path=args.data_dir,
@@ -247,6 +248,7 @@ def run(args):
     # main training loop
     for loader in data_loaders:
         num_epochs = args.epochs + np.random.randint(0, 13)
+        print("training current distribution for {} epochs".format(num_epochs))
         for epoch in range(1, num_epochs + 1):
             train(epoch, model, optimizer, loader, grapher)
             test(epoch, model, loader, grapher)

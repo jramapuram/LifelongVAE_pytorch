@@ -41,9 +41,10 @@ class VAE(nn.Module):
         elif self.config['reparam_type'] == "mixture":
             print("using mixture reparameterizer")
             assert self.config['latent_size'] > self.config['mixture_discrete_size']
-            num_continuous = self.config['latent_size'] - self.config['mixture_discrete_size']
+            #num_continuous = self.config['latent_size'] - self.config['mixture_discrete_size']
             self.reparameterizer = Mixture(num_discrete=self.config['mixture_discrete_size'],
-                                           num_continuous=num_continuous,
+                                           #num_continuous=num_continuous,
+                                           num_continuous=self.config['latent_size'],
                                            config=self.config)
         else:
             raise Exception("unknown reparameterization type")
@@ -185,41 +186,24 @@ class VAE(nn.Module):
 
         return decoder
 
-    def _lazy_init_encoder_dense(self, input_size):
+    def _lazy_init_dense(self, input_size, output_size, name='enc_proj'):
         '''initialize the dense linear projection lazily
            because determining convolutional output size
            is annoying '''
-        if not hasattr(self, 'latent_projector'):
-            # compute the output size based on the
-            # reparametrization type. (eg: 2x for gaussian mean/cov)
-            output_size = self.reparameterizer.output_size
-
+        if not hasattr(self, name):
             # build a simple linear projector
-            self.latent_projector =  nn.Sequential(
+            setattr(self, name, nn.Sequential(
                 View([-1, input_size]),
                 nn.Linear(input_size, output_size)
-            )
+            ))
 
             if self.config['ngpu'] > 1:
-                self.latent_projector = nn.DataParallel(self.latent_projector)
+                setattr(self, name,
+                        nn.DataParallel(getattr(self, name))
+                )
 
             if self.config['cuda']:
-                self.latent_projector = self.latent_projector.cuda()
-
-    def encode(self, x):
-        ''' encodes via a convolution
-            and lazy init's a dense projector'''
-        batch_size = x.size(0)
-
-        # return self.encoder(x).squeeze()
-
-        # do the convolution
-        conv = self.encoder(x)
-        conv_output_shp = int(np.prod(conv.size()[1:]))
-
-        # project via linear layer
-        self._lazy_init_encoder_dense(conv_output_shp)
-        return self.latent_projector(conv)
+                setattr(self, name, getattr(self, name).cuda())
 
     def reparameterize(self, logits):
         ''' reparameterizes the latent logits appropriately '''
@@ -233,8 +217,25 @@ class VAE(nn.Module):
         else:
             raise Exception("unknown nll provided")
 
+    def encode(self, x):
+        ''' encodes via a convolution
+            and lazy init's a dense projector'''
+        conv = self.encoder(x)         # do the convolution
+        conv_output_shp = int(np.prod(conv.size()[1:]))
+
+        # project via linear layer
+        self._lazy_init_dense(conv_output_shp,
+                              self.reparameterizer.input_size,
+                              name='enc_proj')
+        return self.enc_proj(conv)
+
     def decode(self, z):
-        logits = self.decoder(z)
+        # project via linear layer
+        self._lazy_init_dense(self.reparameterizer.output_size,
+                              self.latent_size, 'dec_proj')
+        z_proj = self.dec_proj(z)
+
+        logits = self.decoder(z_proj)
         return self._nll_activation(logits)
 
     def forward(self, x):

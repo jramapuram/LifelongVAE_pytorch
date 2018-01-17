@@ -29,7 +29,7 @@ parser.add_argument('--task', type=str, default="mnist",
 parser.add_argument('--epochs', type=int, default=10, metavar='N',
                     help='minimum number of epochs to train (default: 10)')
 parser.add_argument('--latent-size', type=int, default=32, metavar='L',
-                    help='latent size (default: 32)')
+                    help='latent size [or if mixture size of continuous](default: 32)')
 parser.add_argument('--mixture-discrete-size', type=int, default=32,
                     help='dim of discrete variable when using mixture (default: 32)')
 parser.add_argument('--download', type=int, default=1,
@@ -173,6 +173,16 @@ def test(epoch, model, data_loader, grapher):
     grapher.show()
 
 
+def generate(model, grapher):
+    model.eval()
+    gen = model.student.reparameterizer.prior(
+        [args.batch_size, args.latent_size]
+    )
+    gen = model.student.decode(gen)
+    gen = torch.min(gen, ones_like(gen, args.cuda))
+    grapher.register_single({'generated': gen}, plot_type='imgs')
+
+
 def get_model_and_loader():
     ''' helper to return the model and the loader '''
     # we build 10 samplers as all of the below have 10 classes
@@ -224,14 +234,10 @@ def get_model_and_loader():
     return [student_teacher, loaders, grapher]
 
 
-def lazy_generate_modules(model, data_loader):
+def lazy_generate_modules(model, img_shp):
     ''' Super hax, but needed for building lazy modules '''
-    for data, _ in data_loader.train_loader:
-        if args.cuda:
-            data = data.cuda()
-
-        model(Variable(data))
-        break
+    data = float_type(args.cuda)(args.batch_size, *img_shp).normal_()
+    model(Variable(data))
 
 
 def run(args):
@@ -240,18 +246,31 @@ def run(args):
 
     # since some modules are lazy generated
     # we want to run a single fwd pass
-    lazy_generate_modules(model, data_loaders[0])
+    lazy_generate_modules(model, data_loaders[0].img_shp)
 
     # collect our optimizer
     optimizer = build_optimizer(model)
 
     # main training loop
-    for loader in data_loaders:
+    for j, loader in enumerate(data_loaders):
         num_epochs = args.epochs + np.random.randint(0, 13)
         print("training current distribution for {} epochs".format(num_epochs))
         for epoch in range(1, num_epochs + 1):
             train(epoch, model, optimizer, loader, grapher)
             test(epoch, model, loader, grapher)
+            generate(model, grapher)
+
+        if j != len(data_loaders) - 1:
+            # spawn a new student & rebuild grapher
+            # we also pass the new model's parameters through
+            # a new optimizer
+            model.fork()
+            lazy_generate_modules(model, data_loaders[0].img_shp)
+            optimizer = build_optimizer(model)
+            grapher = Grapher(env=model.get_name(),
+                              server=args.visdom_url,
+                              port=args.visdom_port)
+
 
 if __name__ == "__main__":
     run(args)

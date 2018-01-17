@@ -15,7 +15,9 @@ class IsotropicGaussian(nn.Module):
     def __init__(self, config):
         super(IsotropicGaussian, self).__init__()
         self.config = config
-        self.output_size = self.config['latent_size']*2
+        self.input_size = self.config['latent_size']
+        assert self.config['latent_size'] % 2 == 0
+        self.output_size = self.config['latent_size'] // 2
 
     def prior(self, shape):
         return Variable(

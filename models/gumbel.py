@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
 
-from helpers.utils import float_type, generate_random_categorical
+from helpers.utils import float_type, one_hot
 from models.layers import View, Identity, UpsampleConvLayer
 
 
@@ -16,16 +16,18 @@ class GumbelSoftmax(nn.Module):
         self._setup_anneal_params()
         self.iteration = 0
         self.config = config
+        self.input_size = self.config['latent_size']
         self.output_size = self.config['latent_size']
 
     def prior(self, shape):
-        p =generate_random_categorical(shape[0],
-                                       shape[1],
-                                       use_cuda=self.config['cuda'])
-        if not isinstance(p, Variable):
-            p = Variable(p)
-
-        return p
+        uniform_probs = float_type(self.config['cuda'])(1, shape[1]).zero_()
+        uniform_probs += 1.0 / shape[1]
+        cat = torch.distributions.Categorical(uniform_probs)
+        sample = cat.sample_n(shape[0])
+        return Variable(
+            one_hot(shape[1], sample, use_cuda=self.config['cuda'])
+        ).type(float_type(self.config['cuda']))
+        #return Variable(sample.view(-1, shape[1]))
 
     def _setup_anneal_params(self):
         # setup the base gumbel rates
@@ -52,7 +54,7 @@ class GumbelSoftmax(nn.Module):
             # self.tau = np.maximum(0.9 * self.tau, self.min_temp)
 
     def reparmeterize(self, logits, eps=1e-9):
-        q_z = F.softmax(logits + eps)
+        q_z = F.softmax(logits + eps, dim=-1)
         z, z_hard = self.sample_gumbel(logits, self.tau,
                                        hard=True,
                                        use_cuda=self.config['cuda'])
@@ -82,7 +84,7 @@ class GumbelSoftmax(nn.Module):
 
         noise = Variable(noise)
         x = (x + noise) / tau
-        x = F.softmax(x.view(x.size(0), -1) + eps)
+        x = F.softmax(x.view(x.size(0), -1) + eps, dim=-1)
         return x.view_as(x)
 
     @staticmethod

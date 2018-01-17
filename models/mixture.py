@@ -18,8 +18,8 @@ class Mixture(nn.Module):
     def __init__(self, num_discrete, num_continuous, config):
         super(Mixture, self).__init__()
         self.config = config
-        self.num_discrete = num_discrete
-        self.num_continuous = num_continuous*2
+        self.num_discrete_input = num_discrete
+        self.num_continuous_input = num_continuous
 
         # setup the gaussian config
         gaussian_config = copy.deepcopy(config)
@@ -31,30 +31,25 @@ class Mixture(nn.Module):
         discrete_config['latent_size'] = num_discrete
         self.discrete = GumbelSoftmax(discrete_config)
 
+        self.input_size = num_continuous + num_discrete
         self.output_size = self.discrete.output_size + self.gaussian.output_size
 
     def prior(self, shape):
         batch_size = shape[0]
-        disc = self.discrete.prior([batch_size, self.num_discrete])
-        cont = self.gaussian.prior([batch_size, self.num_continuous])
+        disc = self.discrete.prior([batch_size, self.discrete.output_size])
+        cont = self.gaussian.prior([batch_size, self.gaussian.output_size])
         return torch.cat([cont, disc], 1)
 
     def mutual_info(self, params, eps=1e-9):
         q_z_given_x = params['discrete']['q_z']
-        batch_size = q_z_given_x.size(0)
-        n_features = q_z_given_x.size(-1)
-        cat = torch.distributions.Categorical(
-            ones_like(q_z_given_x, self.config['cuda']).div_(n_features)
-        )
-        p_z = cat.sample_n(batch_size) # prior sample
-
+        p_z = self.discrete.prior(q_z_given_x.size())
         crossent_loss = torch.mean(-torch.sum(p_z * torch.log(q_z_given_x + eps), dim=1))
         ent_loss = torch.mean(-torch.sum(p_z * torch.log(p_z + eps), dim=1))
         return crossent_loss + ent_loss
 
     def reparmeterize(self, logits):
-        gaussian_logits = logits[:, 0:self.num_continuous]
-        discrete_logits = logits[:, self.num_continuous:]
+        gaussian_logits = logits[:, 0:self.num_continuous_input]
+        discrete_logits = logits[:, self.num_continuous_input:]
 
         gaussian_reparam, gauss_params = self.gaussian(gaussian_logits)
         discrete_reparam, disc_params = self.discrete(discrete_logits)

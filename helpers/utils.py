@@ -180,26 +180,20 @@ def one_hot_np(num_cols, indices):
     return mat
 
 
-def one_hot(size, index, use_cuda=False):
+def one_hot(num_cols, indices, use_cuda=False):
     """ Creates a matrix of one hot vectors.
-        ```
-        import torch
-        import torch_extras
-        setattr(torch, 'one_hot', torch_extras.one_hot)
-        size = (3, 3)
-        index = torch.LongTensor([2, 0, 1]).view(-1, 1)
-        torch.one_hot(size, index)
-        # [[0, 0, 1], [1, 0, 0], [0, 1, 0]]
-        ```
-    """
-    mask = long_type(use_cuda)(*size).fill_(0)
-    ones = 1
-    if isinstance(index, Variable):
-        ones = Variable(long_type(use_cuda)(index.size()).fill_(1))
-        mask = Variable(mask, volatile=index.volatile)
 
-    ret = mask.scatter_(1, index, ones)
-    return ret
+        - num_cols: int
+        - indices: FloatTensor array
+    """
+    batch_size = indices.size(0)
+    mask = long_type(use_cuda)(batch_size, num_cols).fill_(0)
+    ones = 1
+    if isinstance(indices, Variable):
+        ones = Variable(long_type(use_cuda)(indices.size()).fill_(1))
+        mask = Variable(mask, volatile=indices.volatile)
+
+    return mask.scatter_(1, indices, ones)
 
 
 def to_data(tensor_or_var):

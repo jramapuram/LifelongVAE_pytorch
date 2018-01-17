@@ -11,11 +11,20 @@ from models.vae import VAE
 from helpers.utils import expand_dims, long_type, squeeze_expand_dim, ones_like
 
 
+def detach_from_graph(param_map):
+    for _, v in param_map.items():
+        if isinstance(v, dict):
+            detach_from_graph(v)
+        else:
+            v = v.detach_()
+
+
 def kl_categorical_categorical(dist_a, dist_b, eps=1e-9):
     # https://github.com/tensorflow/tensorflow/blob/r1.1/tensorflow/contrib/distributions/python/ops/categorical.py
     delta_log_probs1 = F.log_softmax(dist_a['logits'], dim=-1) \
                        - F.log_softmax(dist_b['logits'], dim=-1)
-    return torch.sum(F.softmax(dist_a['logits']) * delta_log_probs1, axis=-1)
+    return torch.sum(F.softmax(dist_a['logits'], dim=-1) * delta_log_probs1, dim=-1)
+
 
 def kl_isotropic_gauss_gauss(dist_a, dist_b, eps=1e-9):
     # https://github.com/tensorflow/tensorflow/blob/r1.1/tensorflow/contrib/distributions/python/ops/normal.py
@@ -24,6 +33,7 @@ def kl_isotropic_gauss_gauss(dist_a, dist_b, eps=1e-9):
     ratio = sigma_a_sq / sigma_b_sq
     return torch.pow(dist_a['mu'] - dist_b['mu'], 2) / (2 * sigma_b_sq) \
         + 0.5 * (ratio - 1 - torch.log(ratio + eps))
+
 
 class StudentTeacher(nn.Module):
     def __init__(self, initial_model, **kwargs):
@@ -43,9 +53,11 @@ class StudentTeacher(nn.Module):
 
     def posterior_regularizer(self, q_z_given_x_t, q_z_given_x_s):
         if 'discrete' in q_z_given_x_s and 'discrete' in q_z_given_x_t:
-            return kl_categorical_categorical(q_z_given_x_s, q_z_given_x_t)
+            return torch.mean(kl_categorical_categorical(q_z_given_x_s['discrete'],
+                                                         q_z_given_x_t['discrete']))
         elif 'gaussian' in q_z_given_x_s and 'gaussian' in q_z_given_x_t:
-            return kl_isotropic_gauss_gauss(q_z_given_x_s, q_z_given_x_t)
+            return kl_isotropic_gauss_gauss(q_z_given_x_s['gaussian'],
+                                            q_z_given_x_t['gaussian'])
         else:
             raise NotImplementedError("unknown distribution requested for kl")
 
@@ -57,9 +69,9 @@ class StudentTeacher(nn.Module):
         if 'teacher' in output_map:
             posterior_regularizer = self.posterior_regularizer(output_map['teacher']['params'],
                                                                output_map['student']['params'])
-            return vae_loss + posterior_regularizer
+            vae_loss['loss'] += posterior_regularizer
+            vae_loss['posterior_regularizer'] = posterior_regularizer
 
-        # base case (only 1 model)
         return vae_loss
 
     def fork(self):
@@ -67,8 +79,8 @@ class StudentTeacher(nn.Module):
         config_copy['mixture_discrete_size'] += 1
         self.teacher = deepcopy(self.student)
         self.student = VAE(input_shape=self.teacher.input_shape,
-                           latent_size=self.teacher.latent_size + 1,
-                           kwargs={'kwargs': self.config}
+                           latent_size=self.teacher.latent_size,
+                           **{'kwargs': config_copy}
         )
 
         # copy the teacher weights into the student model
@@ -90,14 +102,13 @@ class StudentTeacher(nn.Module):
 
     def _augment_data(self, x):
         ''' return batch_size worth of samples that are augmented
-            withOption "RegistryDwords" "PerfLevelSrc=0x2222"
- samples access synology as disk drive usbfrom the teacher model '''
+            from the teacher model '''
         if self.ratio == 1.0:
-            return x
+            return x            # base case
 
         batch_size = x.size(0)
         num_teacher_samples = int(batch_size * self.ratio)
-        num_student_samples = min(batch_size - num_teacher_samples, 1)
+        num_student_samples = max(batch_size - num_teacher_samples, 1)
         generated_teacher_samples = self.generate_synthetic_samples(self.teacher, batch_size)
         return torch.cat([x[0:num_student_samples],
                           generated_teacher_samples[0:num_teacher_samples]], 0)
@@ -109,7 +120,8 @@ class StudentTeacher(nn.Module):
             # return the student and teacher params
             # only teacher Q(z|x) is needed, so dont run decode step
             z_logits_teacher = self.teacher.encode(x)
-            z_teacher, params_teacher = self.reparameterize(z_logits_teacher)
+            _, params_teacher = self.teacher.reparameterize(z_logits_teacher)
+            detach_from_graph(params_teacher)
             return {
                 'teacher': {
                     'params': params_teacher

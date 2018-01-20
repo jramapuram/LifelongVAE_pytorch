@@ -28,10 +28,10 @@ parser.add_argument('--task', type=str, default="mnist",
                     help="task to work on [mnist / cifar10 / fashion / svhn_centered / svhn / clutter] (default: mnist)")
 parser.add_argument('--epochs', type=int, default=10, metavar='N',
                     help='minimum number of epochs to train (default: 10)')
-parser.add_argument('--latent-size', type=int, default=32, metavar='L',
-                    help='latent size [or if mixture size of continuous](default: 32)')
-parser.add_argument('--mixture-discrete-size', type=int, default=32,
-                    help='dim of discrete variable when using mixture (default: 32)')
+parser.add_argument('--continuous-size', type=int, default=32, metavar='L',
+                    help='latent size of continuous variable when using mixture or gaussian (default: 32)')
+parser.add_argument('--discrete-size', type=int, default=1,
+                    help='initial dim of discrete variable when using mixture or gumbel (default: 1)')
 parser.add_argument('--download', type=int, default=1,
                     help='download dataset from s3 (default: 1)')
 parser.add_argument('--data-dir', type=str, default='./data_dir',
@@ -91,7 +91,6 @@ def build_optimizer(model):
 def train(epoch, model, optimizer, data_loader, grapher):
     global TOTAL_ITER
     model.train()
-    correct = 0
 
     for batch_idx, (data, target) in enumerate(data_loader.train_loader):
         if args.cuda:
@@ -105,7 +104,7 @@ def train(epoch, model, optimizer, data_loader, grapher):
 
         # run the VAE + the DNN on the latent space
         output_map = model(data)
-        loss = model.loss_function(output_map, data) # vae loss terms
+        loss = model.loss_function(output_map) # vae loss terms
 
         # compute loss
         #loss.backward(retain_graph=True)
@@ -125,7 +124,9 @@ def train(epoch, model, optimizer, data_loader, grapher):
                                     plot_type='line')
             grapher.register_single({'train_nll': [[TOTAL_ITER], [loss['nll'].data[0]]]},
                                     plot_type='line')
-            register_images(output_map['student']['x_reconstr'], data, grapher)
+            register_images(output_map['student']['x_reconstr'],
+                            output_map['augmented']['data'],
+                            grapher)
             grapher.show()
 
 
@@ -154,7 +155,7 @@ def test(epoch, model, data_loader, grapher):
             target = torch.squeeze(target)
 
         output_map = model(data)
-        loss_t = model.loss_function(output_map, data) # vae loss terms
+        loss_t = model.loss_function(output_map) # vae loss terms
         test_loss += loss_t['loss'].data[0]
         test_kld += loss_t['kld'].data[0]
         test_nll += loss_t['nll'].data[0]
@@ -169,16 +170,20 @@ def test(epoch, model, data_loader, grapher):
     grapher.register_single({'test_loss': [[epoch], [test_loss]]}, plot_type='line')
     grapher.register_single({'test_kld': [[epoch], [test_kld]]}, plot_type='line')
     grapher.register_single({'test_nll': [[epoch], [test_nll]]}, plot_type='line')
-    register_images(output_map['student']['x_reconstr'], data, grapher, 'test')
+    register_images(output_map['student']['x_reconstr'],
+                    output_map['augmented']['data'],
+                    grapher, 'test')
     grapher.show()
 
 
 def generate(model, grapher):
     model.eval()
-    gen = model.student.reparameterizer.prior(
-        [args.batch_size, args.latent_size]
-    )
-    gen = model.student.decode(gen)
+    # gen = model.student.reparameterizer.prior(
+    #     [args.batch_size, model.student.reparameterizer.output_size]
+    # )
+    # gen =  model.student.nll_activation(model.student.decode(gen))
+    gen = model.generate_synthetic_samples(model.student,
+                                           args.batch_size)
     gen = torch.min(gen, ones_like(gen, args.cuda))
     grapher.register_single({'generated': gen}, plot_type='imgs')
 
@@ -217,9 +222,9 @@ def get_model_and_loader():
     else:
         raise Exception("unknown dataset provided / not supported yet")
 
-    # build the VAE
+    # append the image shape to the config & build the VAE
+    args.img_shp =  loaders[0].img_shp,
     vae = VAE(loaders[0].img_shp,
-              args.latent_size,
               kwargs=vars(args))
 
     # build the combiner which takes in the VAE as a parameter

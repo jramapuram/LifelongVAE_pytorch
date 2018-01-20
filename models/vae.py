@@ -14,10 +14,9 @@ from helpers.utils import float_type
 
 
 class VAE(nn.Module):
-    def __init__(self, input_shape, latent_size, activation_fn=nn.ReLU, **kwargs):
+    def __init__(self, input_shape, activation_fn=nn.ReLU, **kwargs):
         super(VAE, self).__init__()
         self.input_shape = input_shape
-        self.latent_size = latent_size
         self.activation_fn = activation_fn
         self.is_color = input_shape[0] > 1
         self.chans = 3 if self.is_color else 1
@@ -26,10 +25,6 @@ class VAE(nn.Module):
         self.config = kwargs['kwargs']
         pp = pprint.PrettyPrinter(indent=4)
         pp.pprint(self.config)
-
-        # build the encoder and decoder
-        self.encoder = self.build_encoder()
-        self.decoder = self.build_decoder()
 
         # build the reparameterizer
         if self.config['reparam_type'] == "isotropic_gaussian":
@@ -40,18 +35,25 @@ class VAE(nn.Module):
             self.reparameterizer = GumbelSoftmax(self.config)
         elif self.config['reparam_type'] == "mixture":
             print("using mixture reparameterizer")
-            assert self.config['latent_size'] > self.config['mixture_discrete_size']
-            #num_continuous = self.config['latent_size'] - self.config['mixture_discrete_size']
-            self.reparameterizer = Mixture(num_discrete=self.config['mixture_discrete_size'],
-                                           #num_continuous=num_continuous,
-                                           num_continuous=self.config['latent_size'],
+            self.reparameterizer = Mixture(num_discrete=self.config['discrete_size'],
+                                           num_continuous=self.config['continuous_size'],
                                            config=self.config)
         else:
             raise Exception("unknown reparameterization type")
 
+        # build the encoder and decoder
+        self.encoder = self.build_encoder()
+        self.decoder = self.build_decoder()
+
     def get_name(self):
+        if self.config['reparam_type'] == "mixture":
+            param_str = "_disc" + str(self.config['discrete_size']) + \
+                        "_cont" + str(self.config['continuous_size'])
+        else:
+            param_str = "latent" + str(self.config['continuous_size'])
+
         full_hash_str = "_input" + str(self.input_shape) + \
-                        "_latent" + str(self.config['latent_size']) + \
+                        param_str + \
                         "_batch" + str(self.config['batch_size']) + \
                         "_filter_depth" + str(self.config['filter_depth']) + \
                         "_nll" + str(self.config['nll_type']) + \
@@ -68,7 +70,7 @@ class VAE(nn.Module):
                                                      .replace('(', '') \
                                                      .replace(')', '') \
                                                      .replace('\'', '')
-        return 'supvae_' + self.config['task'] + full_hash_str
+        return 'vae_' + self.config['task'] + full_hash_str
 
     def build_encoder(self):
         ''' helper function to build convolutional encoder'''
@@ -82,43 +84,43 @@ class VAE(nn.Module):
                 # input dim: num_channels x 32 x 32
                 nn.Conv2d(self.chans, self.config['filter_depth'], 5, stride=1, bias=True),
                 nn.BatchNorm2d(self.config['filter_depth']),
-                nn.ELU(inplace=True),
+                self.activation_fn(inplace=True),
                 # state dim: 32 x 28 x 28
                 nn.Conv2d(self.config['filter_depth'], self.config['filter_depth']*2, 4, stride=2, bias=True),
                 nn.BatchNorm2d(self.config['filter_depth']*2),
-                nn.ELU(inplace=True),
+                self.activation_fn(inplace=True),
                 # state dim: 64 x 13 x 13
                 nn.Conv2d(self.config['filter_depth']*2, self.config['filter_depth']*4, 4, stride=1, bias=True),
                 nn.BatchNorm2d(self.config['filter_depth']*4),
-                nn.ELU(inplace=True),
+                self.activation_fn(inplace=True),
                 # state dim: 128 x 10 x 10
                 nn.Conv2d(self.config['filter_depth']*4, self.config['filter_depth']*8, 4, stride=2, bias=True),
                 nn.BatchNorm2d(self.config['filter_depth']*8),
-                nn.ELU(inplace=True),
+                self.activation_fn(inplace=True),
                 # state dim: 256 x 4 x 4
                 nn.Conv2d(self.config['filter_depth']*8, self.config['filter_depth']*16, 4, stride=1, bias=True),
                 nn.BatchNorm2d(self.config['filter_depth']*16),
-                nn.ELU(inplace=True),
+                self.activation_fn(inplace=True),
                 # state dim: 512 x 1 x 1
                 nn.Conv2d(self.config['filter_depth']*16, self.config['filter_depth']*16, 1, stride=1, bias=True),
                 nn.BatchNorm2d(self.config['filter_depth']*16),
-                nn.ELU(inplace=True),
+                self.activation_fn(inplace=True),
                 # state dim: 512 x 1 x 1
-                nn.Conv2d(self.config['filter_depth']*16, self.latent_size, 1, stride=1, bias=True)
+                nn.Conv2d(self.config['filter_depth']*16, self.reparameterizer.input_size, 1, stride=1, bias=True)
                 # output dim: opt.z_dim x 1 x 1
             )
         elif self.config['layer_type'] == 'dense':
             encoder = nn.Sequential(
                 View([-1, int(np.prod(self.input_shape))]),
-                nn.Linear(int(np.prod(self.input_shape)), self.latent_size),
-                nn.BatchNorm1d(self.latent_size),
-                nn.ReLU(),
-                nn.Linear(self.latent_size, self.latent_size),
-                nn.BatchNorm1d(self.latent_size),
-                nn.ReLU(),
-                nn.Linear(self.latent_size, self.latent_size),
-                nn.BatchNorm1d(self.latent_size),
-                nn.ReLU(),
+                nn.Linear(int(np.prod(self.input_shape)), self.reparameterizer.input_size),
+                nn.BatchNorm1d(self.reparameterizer.input_size),
+                self.activation_fn(),
+                nn.Linear(self.reparameterizer.input_size, self.reparameterizer.input_size),
+                nn.BatchNorm1d(self.reparameterizer.input_size),
+                self.activation_fn(),
+                nn.Linear(self.reparameterizer.input_size, self.reparameterizer.input_size)
+                # nn.BatchNorm1d(self.reparameterizer.input_size),
+                # self.activation_fn(),
             )
         else:
             raise Exception("unknown layer type requested")
@@ -137,27 +139,27 @@ class VAE(nn.Module):
         if self.config['layer_type'] == 'conv':
             upsampler = nn.Upsample(size=self.input_shape[1:], mode='bilinear')
             decoder = nn.Sequential(
-                View([-1, self.latent_size, 1, 1]),
+                View([-1, self.reparameterizer.output_size, 1, 1]),
                 # input dim: z_dim x 1 x 1
-                nn.ConvTranspose2d(self.latent_size, self.config['filter_depth']*8, 4, stride=1, bias=True),
+                nn.ConvTranspose2d(self.reparameterizer.output_size, self.config['filter_depth']*8, 4, stride=1, bias=True),
                 nn.BatchNorm2d(self.config['filter_depth']*8),
-                nn.ELU(inplace=True),
+                self.activation_fn(inplace=True),
                 # state dim:   256 x 4 x 4
                 nn.ConvTranspose2d(self.config['filter_depth']*8, self.config['filter_depth']*4, 4, stride=2, bias=True),
                 nn.BatchNorm2d(self.config['filter_depth']*4),
-                nn.ELU(inplace=True),
+                self.activation_fn(inplace=True),
                 # state dim: 128 x 10 x 10
                 nn.ConvTranspose2d(self.config['filter_depth']*4, self.config['filter_depth']*2, 4, stride=1, bias=True),
                 nn.BatchNorm2d(self.config['filter_depth']*2),
-                nn.ELU(inplace=True),
+                self.activation_fn(inplace=True),
                 # state dim: 64 x 13 x 13
                 nn.ConvTranspose2d(self.config['filter_depth']*2, self.config['filter_depth'], 4, stride=2, bias=True),
                 nn.BatchNorm2d(self.config['filter_depth']),
-                nn.ELU(inplace=True),
+                self.activation_fn(inplace=True),
                 # state dim: 32 x 28 x 28
                 nn.ConvTranspose2d(self.config['filter_depth'], self.config['filter_depth'], 5, stride=1, bias=True),
                 nn.BatchNorm2d(self.config['filter_depth']),
-                nn.ELU(inplace=True),
+                self.activation_fn(inplace=True),
                 # state dim: 32 x 32 x 32
                 nn.Conv2d(self.config['filter_depth'], self.chans, 1, stride=1, bias=True),
                 # output dim: num_channels x 32 x 32
@@ -165,14 +167,14 @@ class VAE(nn.Module):
             )
         elif self.config['layer_type'] == 'dense':
             decoder = nn.Sequential(
-                View([-1, self.latent_size]),
-                nn.Linear(self.latent_size, self.latent_size),
-                nn.BatchNorm1d(self.latent_size),
-                nn.ReLU(),
-                nn.Linear(self.latent_size, self.latent_size),
-                nn.BatchNorm1d(self.latent_size),
-                nn.ReLU(),
-                nn.Linear(self.latent_size, int(np.prod(self.input_shape))),
+                View([-1, self.reparameterizer.output_size]),
+                nn.Linear(self.reparameterizer.output_size, self.reparameterizer.output_size),
+                nn.BatchNorm1d(self.reparameterizer.output_size),
+                self.activation_fn(),
+                nn.Linear(self.reparameterizer.output_size, self.reparameterizer.output_size),
+                nn.BatchNorm1d(self.reparameterizer.output_size),
+                self.activation_fn(),
+                nn.Linear(self.reparameterizer.output_size, int(np.prod(self.input_shape))),
                 View([-1] + self.input_shape)
             )
         else:
@@ -209,7 +211,7 @@ class VAE(nn.Module):
         ''' reparameterizes the latent logits appropriately '''
         return self.reparameterizer(logits)
 
-    def _nll_activation(self, logits):
+    def nll_activation(self, logits):
         if self.config['nll_type'] == "gaussian":
             return logits
         elif self.config['nll_type'] == "bernoulli":
@@ -231,12 +233,14 @@ class VAE(nn.Module):
 
     def decode(self, z):
         # project via linear layer
-        self._lazy_init_dense(self.reparameterizer.output_size,
-                              self.latent_size, 'dec_proj')
-        z_proj = self.dec_proj(z)
+        # self._lazy_init_dense(self.reparameterizer.output_size,
+        #                       self.reparameterizer.output_size, 'dec_proj')
+        # z_proj = self.dec_proj(z)
 
-        logits = self.decoder(z_proj)
-        return self._nll_activation(logits)
+        # logits = self.decoder(z_proj)
+        logits = self.decoder(z.contiguous())
+        #return self._nll_activation(logits)
+        return logits
 
     def forward(self, x):
         ''' params is a map of the latent variable's parameters'''

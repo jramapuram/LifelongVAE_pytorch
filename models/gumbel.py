@@ -16,8 +16,8 @@ class GumbelSoftmax(nn.Module):
         self._setup_anneal_params()
         self.iteration = 0
         self.config = config
-        self.input_size = self.config['latent_size']
-        self.output_size = self.config['latent_size']
+        self.input_size = self.config['discrete_size']
+        self.output_size = self.config['discrete_size']
 
     def prior(self, shape):
         uniform_probs = float_type(self.config['cuda'])(1, shape[1]).zero_()
@@ -65,12 +65,13 @@ class GumbelSoftmax(nn.Module):
         log_p_z = np.log(1.0 / latent_size)
         log_q_z = torch.log(q_z + eps)
         kld_element = q_z * (log_q_z - log_p_z)
-        return torch.mean(kld_element)
+        #return torch.mean(kld_element)
+        return torch.sum(kld_element)
 
     def kl(self, dist_a):
         return GumbelSoftmax._kld_categorical_uniform(
             dist_a['q_z'],
-            self.config['latent_size']
+            self.config['discrete_size']
         )
 
     @staticmethod

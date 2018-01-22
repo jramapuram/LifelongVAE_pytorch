@@ -43,8 +43,8 @@ class Mixture(nn.Module):
     def mutual_info(self, params, eps=1e-9):
         q_z_given_x = params['discrete']['q_z']
         p_z = self.discrete.prior(q_z_given_x.size())
-        crossent_loss = torch.mean(-torch.sum(p_z * torch.log(q_z_given_x + eps), dim=1))
-        ent_loss = torch.mean(-torch.sum(p_z * torch.log(p_z + eps), dim=1))
+        crossent_loss = torch.mean(-torch.sum(torch.log(q_z_given_x + eps) * p_z, dim=1))
+        ent_loss = torch.mean(-torch.sum(torch.log(p_z + eps) * p_z, dim=1))
         # crossent_loss = torch.sum(-torch.sum(p_z * torch.log(q_z_given_x + eps), dim=1))
         # ent_loss = torch.sum(-torch.sum(p_z * torch.log(p_z + eps), dim=1))
         return crossent_loss + ent_loss

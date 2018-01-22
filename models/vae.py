@@ -55,6 +55,7 @@ class VAE(nn.Module):
         full_hash_str = "_input" + str(self.input_shape) + \
                         param_str + \
                         "_batch" + str(self.config['batch_size']) + \
+                        "_mut" + str(self.config['mut_reg']) + \
                         "_filter_depth" + str(self.config['filter_depth']) + \
                         "_nll" + str(self.config['nll_type']) + \
                         "_reparam" + str(self.config['reparam_type']) + \
@@ -196,6 +197,8 @@ class VAE(nn.Module):
             # build a simple linear projector
             setattr(self, name, nn.Sequential(
                 View([-1, input_size]),
+                nn.BatchNorm1d(input_size),
+                self.activation_fn(),
                 nn.Linear(input_size, output_size)
             ))
 
@@ -250,6 +253,7 @@ class VAE(nn.Module):
 
     def nll(self, recon_x, x, params):
         if self.config['nll_type'] == "gaussian":
+            raise NotImplementedError("gaussian nll not working currently")
             return self.nll_gaussian(recon_x, x,
                                      params['mu'],
                                      params['logvar'])
@@ -285,8 +289,11 @@ class VAE(nn.Module):
         return self.reparameterizer.kl(dist_a)
 
     def loss_function(self, recon_x, x, params):
+        # tf: elbo = -log_likelihood + latent_kl
+        # tf: cost = elbo + consistency_kl - self.mutual_info_reg * mutual_info_regularizer
         nll = self.nll(recon_x, x, params)
         kld = self.kld(params)
+        elbo = nll + kld
         mut_info = 0.0
 
         # add the mutual information regularizer if
@@ -295,7 +302,9 @@ class VAE(nn.Module):
             mut_info += self.reparameterizer.mutual_info(params)
 
         return {
-            'loss': nll + kld + self.config['mut_reg'] * mut_info,
+            #'loss': nll + kld + self.config['mut_reg'] * mut_info,
+            'loss': elbo - self.config['mut_reg'] * mut_info,
+            'elbo': elbo,
             'nll': nll,
             'kld': kld,
             'mut_info': mut_info,

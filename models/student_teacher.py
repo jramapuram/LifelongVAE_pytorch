@@ -19,11 +19,18 @@ def detach_from_graph(param_map):
             v = v.detach_()
 
 
-def kl_categorical_categorical(dist_a, dist_b, eps=1e-9):
+def kl_categorical_categorical(dist_a, dist_b, from_index=0, cuda=False):
     # https://github.com/tensorflow/tensorflow/blob/r1.1/tensorflow/contrib/distributions/python/ops/categorical.py
-    delta_log_probs1 = F.log_softmax(dist_a['logits'], dim=-1) \
-                       - F.log_softmax(dist_b['logits'], dim=-1)
-    return torch.sum(F.softmax(dist_a['logits'], dim=-1) * delta_log_probs1, dim=-1)
+    dist_a_log_softmax = F.log_softmax(dist_a['logits'], dim=-1)
+    dist_a_softmax = F.softmax(dist_a['logits'][from_index:], dim=-1)
+    dist_b_log_softmax = F.log_softmax(dist_b['logits'], dim=-1)
+    # zero pad the smaller categorical
+    dist_a_log_softmax, dist_b_log_softmax \
+        = zero_pad_smaller_cat(dist_a_log_softmax[from_index:],
+                               dist_b_log_softmax[from_index:],
+                               cuda=cuda)
+    delta_log_probs1 = dist_a_log_softmax - dist_b_log_softmax
+    return torch.sum(dist_a_softmax * delta_log_probs1, dim=-1)
 
 
 def kl_isotropic_gauss_gauss(dist_a, dist_b, eps=1e-9):
@@ -33,6 +40,27 @@ def kl_isotropic_gauss_gauss(dist_a, dist_b, eps=1e-9):
     ratio = sigma_a_sq / sigma_b_sq
     return torch.pow(dist_a['mu'] - dist_b['mu'], 2) / (2 * sigma_b_sq) \
         + 0.5 * (ratio - 1 - torch.log(ratio + eps))
+
+
+def zero_pad_smaller_cat(cat1, cat2, cuda=False):
+    c1shp = cat1.size()
+    c2shp = cat2.size()
+    diff = abs(c1shp[1] - c2shp[1])
+
+    # blend in extra zeros appropriately
+    if c1shp[1] > c2shp[1]:
+        cat2 = torch.cat(
+            [cat2,
+             Variable(float_type(cuda)(c2shp[0], diff).zero_())],
+            dim=-1)
+    elif c2shp[1] > c1shp[1]:
+        cat1 = torch.cat(
+            [cat1,
+             Variable(float_type(cuda)(c1shp[0], diff).zero_())],
+            dim=-1)
+
+    return [cat1, cat2]
+
 
 
 class StudentTeacher(nn.Module):
@@ -54,44 +82,19 @@ class StudentTeacher(nn.Module):
         #return teacher_name + "student_" + self.student.get_name()
         return str(self.current_model) + self.student.get_name()
 
-    def zero_pad_smaller_cat(self, cat1, cat2):
-        c1shp = cat1.size()
-        c2shp = cat2.size()
-        diff = abs(c1shp[1] - c2shp[1])
-
-        # blend in extra zeros appropriately
-        if c1shp[1] > c2shp[1]:
-            cat2 = torch.cat(
-                [cat2,
-                 Variable(float_type(self.config['cuda'])(c2shp[0], diff).zero_())],
-                dim=-1)
-        elif c2shp[1] > c1shp[1]:
-            cat1 = torch.cat(
-                [cat1,
-                 Variable(float_type(self.config['cuda'])(c1shp[0], diff).zero_())],
-                dim=-1)
-
-        return [cat1, cat2]
-
     def posterior_regularizer(self, q_z_given_x_t, q_z_given_x_s):
         ''' TODO: cleanup this function by ensuring discrete
         and gumbel return map with name '''
         if 'discrete' in q_z_given_x_s and 'discrete' in q_z_given_x_t:
-            # zero pad the smaller categorical
-            # print("teacher shp = ", q_z_given_x_t['discrete']['logits'].size(),
-            # " student = ", q_z_given_x_t['discrete']['logits'].size())
-            q_z_given_x_t['discrete']['logits'], q_z_given_x_s['discrete']['logits'] \
-                = self.zero_pad_smaller_cat(q_z_given_x_t['discrete']['logits'][self.num_student_samples:],
-                                            q_z_given_x_s['discrete']['logits'][self.num_student_samples:])
             return torch.mean(kl_categorical_categorical(q_z_given_x_s['discrete'],
-                                                         q_z_given_x_t['discrete']))
+                                                         q_z_given_x_t['discrete'],
+                                                         from_index=self.num_student_samples,
+                                                         cuda=self.config['cuda']))
         elif 'z_hard' in q_z_given_x_s and 'z_hard' in q_z_given_x_t:
-            # zero pad the smaller categorical
-            q_z_given_x_t['logits'], q_z_given_x_s['logits'] \
-                = self.zero_pad_smaller_cat(q_z_given_x_t['logits'],
-                                            q_z_given_x_s['logits'])
             return torch.mean(kl_categorical_categorical(q_z_given_x_s,
-                                                         q_z_given_x_t))
+                                                         q_z_given_x_t,
+                                                         from_index=self.num_student_samples,
+                                                         cuda=self.config['cuda']))
         elif 'mu' in q_z_given_x_s and 'mu' in q_z_given_x_t:
             return torch.mean(kl_isotropic_gauss_gauss(q_z_given_x_s,
                                                        q_z_given_x_t))
@@ -112,21 +115,57 @@ class StudentTeacher(nn.Module):
 
         return vae_loss
 
+    @staticmethod
+    def copy_model(src, dest, disable_dst_grads=False):
+        src_params = list(src.parameters())
+        dest_params = list(dest.parameters())
+        for i in range(len(src_params)):
+            if src_params[i].size() == dest_params[i].size():
+                dest_params[i].data[:] = src_params[i].data[:].clone()
+
+            if disable_dst_grads:
+                dest_params[i].requires_grad = False
+
+        return [src, dest]
+
     def fork(self):
         config_copy = deepcopy(self.student.config)
         config_copy['discrete_size'] += 1
-        self.teacher = deepcopy(self.student)
+        #self.teacher = deepcopy(self.student)
+
+        self.teacher = VAE(input_shape=self.student.input_shape,
+                           **{'kwargs': self.student.config}
+        )
+        data = float_type(self.config['cuda'])(self.student.config['batch_size'],
+                                               *self.student.input_shape).normal_()
+        self.teacher(Variable(data))
+        self.student, self.teacher \
+            = self.copy_model(self.student,
+                              self.teacher,
+                              disable_dst_grads=True)
+
+        # student_params = list(self.student.parameters())
+        # teacher_params = list(self.teacher.parameters())
+        # for i in range(len(student_params)):
+        #     teacher_params[i].data[:] = student_params[i].data[:].clone()
+        #     teacher_params[i].requires_grad = False
+
         self.student = VAE(input_shape=self.teacher.input_shape,
                            **{'kwargs': config_copy}
         )
+        data = float_type(self.config['cuda'])(self.student.config['batch_size'],
+                                               *self.student.input_shape).normal_()
+        self.student(Variable(data))
+        self.teacher, self.student \
+            = self.copy_model(self.teacher, self.student, disable_dst_grads=False)
 
         # copy the teacher weights into the student model
-        for student_param, teacher_param in zip(self.student.parameters(),
-                                                self.teacher.parameters()):
-            student_size = student_param.size()
-            teacher_size = teacher_param.size()
-            if student_size == teacher_size:
-                student_param.data = teacher_param.data.clone()
+        # for student_param, teacher_param in zip(self.student.parameters(),
+        #                                         self.teacher.parameters()):
+        #     student_size = student_param.size()
+        #     teacher_size = teacher_param.size()
+        #     if student_size == teacher_size:
+        #         student_param.data = teacher_param.data.clone()
 
         # update the current model's ratio
         self.current_model += 1
@@ -169,7 +208,7 @@ class StudentTeacher(nn.Module):
         # encode teacher with synthetic data
         if self.teacher is not None:
             # only teacher Q(z|x) is needed, so dont run decode step
-            z_logits_teacher = self.teacher.encode(x)
+            z_logits_teacher = self.teacher.encode(x_augmented)
             _, params_teacher = self.teacher.reparameterize(z_logits_teacher)
             detach_from_graph(params_teacher)
             ret_map['teacher']= {

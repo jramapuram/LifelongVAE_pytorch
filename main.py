@@ -58,6 +58,10 @@ parser.add_argument('--mut-reg', type=float, default=0.3,
 parser.add_argument('--log-interval', type=int, default=10, metavar='N',
                     help='how many batches to wait before logging training status')
 
+# Optimizer
+parser.add_argument('--optimizer', type=str, default="rmsprop",
+                    help="specify optimizer (default: rmsprop)")
+
 # Visdom parameters
 parser.add_argument('--visdom-url', type=str, default="http://localhost",
                     help='visdom URL for graphs (default: http://localhost)')
@@ -85,8 +89,15 @@ TOTAL_ITER = 0
 
 
 def build_optimizer(model):
-    return optim.Adam(model.parameters(), lr=args.lr)
-
+    optim_map = {
+        "rmsprop": optim.RMSprop,
+        "adam": optim.Adam,
+        "adadelta": optim.Adadelta,
+        "sgd": optim.SGD,
+        "lbfgs": optim.LBFGS
+    }
+    filt = filter(lambda p: p.requires_grad, model.parameters())
+    return optim_map[args.optimizer.lower().strip()](filt, lr=args.lr)
 
 def train(epoch, model, optimizer, data_loader, grapher):
     global TOTAL_ITER

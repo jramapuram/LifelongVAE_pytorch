@@ -27,7 +27,6 @@ class GumbelSoftmax(nn.Module):
         return Variable(
             one_hot(shape[1], sample, use_cuda=self.config['cuda'])
         ).type(float_type(self.config['cuda']))
-        #return Variable(sample.view(-1, shape[1]))
 
     def _setup_anneal_params(self):
         # setup the base gumbel rates
@@ -49,29 +48,29 @@ class GumbelSoftmax(nn.Module):
             rate = -self.anneal_rate * self.iteration
             self.tau = np.maximum(self.tau0 * np.exp(rate),
                                   self.min_temp)
+            # print("tau = ", self.tau)
 
             # hard annealing
             # self.tau = np.maximum(0.9 * self.tau, self.min_temp)
 
-    def reparmeterize(self, logits, eps=1e-9):
-        q_z = F.softmax(logits + eps, dim=-1)
+    def reparmeterize(self, logits):
+        log_q_z = F.log_softmax(logits, dim=-1)
         z, z_hard = self.sample_gumbel(logits, self.tau,
                                        hard=True,
                                        use_cuda=self.config['cuda'])
-        return z, z_hard, q_z
+        return z, z_hard, log_q_z
 
     @staticmethod
-    def _kld_categorical_uniform(q_z, latent_size, eps=1e-9):
-        log_p_z = np.log(1.0 / latent_size)
-        log_q_z = torch.log(q_z + eps)
-        kld_element = q_z * (log_q_z - log_p_z)
-        #return torch.mean(kld_element)
-        return torch.sum(kld_element)
+    def _kld_categorical_uniform(log_q_z, eps=1e-9):
+        latent_size = log_q_z.size(-1)
+        p_z = 1.0 / latent_size
+        log_p_z = np.log(p_z + eps)
+        kld_element = log_q_z.exp() * (log_q_z - log_p_z)
+        return torch.sum(kld_element, dim=-1)
 
     def kl(self, dist_a):
         return GumbelSoftmax._kld_categorical_uniform(
-            dist_a['q_z'],
-            self.config['discrete_size']
+            dist_a['discrete']['log_q_z'],
         )
 
     @staticmethod
@@ -106,12 +105,14 @@ class GumbelSoftmax(nn.Module):
 
     def forward(self, logits):
         self.anneal()  # anneal first
-        z, z_hard, q_z = self.reparmeterize(logits)
+        z, z_hard, log_q_z = self.reparmeterize(logits)
         params = {
-            'z': z,
             'z_hard': z_hard,
             'logits': logits,
-            'q_z': q_z
+            'log_q_z': log_q_z
         }
         self.iteration += 1
-        return z, params
+
+        # return the reparameterization
+        # and the params of gumbel
+        return z, { 'z': z, 'discrete': params }

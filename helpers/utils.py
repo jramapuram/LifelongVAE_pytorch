@@ -208,6 +208,20 @@ def float_type(use_cuda):
     return torch.cuda.FloatTensor if use_cuda else torch.FloatTensor
 
 
+def pad(tensor_or_var, num_pad, value=0, prepend=False, dim=-1, cuda=False):
+    if num_pad == 0:
+        return tensor_or_var
+
+    pad_val = float_type(cuda)(num_pad).zero_() + value
+    if isinstance(tensor_or_var, Variable):
+        pad_val = Variable(pad_val)
+
+    if not prepend:
+        return torch.cat([tensor_or_var, pad_val], dim=dim)
+
+    return torch.cat([pad_val, tensor_or_var], dim=dim)
+
+
 def int_type(use_cuda):
     return torch.cuda.IntTensor if use_cuda else torch.IntTensor
 

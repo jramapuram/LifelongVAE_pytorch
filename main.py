@@ -96,8 +96,11 @@ def build_optimizer(model):
         "sgd": optim.SGD,
         "lbfgs": optim.LBFGS
     }
-    filt = filter(lambda p: p.requires_grad, model.parameters())
-    return optim_map[args.optimizer.lower().strip()](filt, lr=args.lr)
+    # filt = filter(lambda p: p.requires_grad, model.parameters())
+    # return optim_map[args.optimizer.lower().strip()](filt, lr=args.lr)
+    return optim_map[args.optimizer.lower().strip()](
+        model.parameters(), lr=args.lr
+    )
 
 def train(epoch, model, optimizer, data_loader, grapher):
     global TOTAL_ITER
@@ -119,21 +122,31 @@ def train(epoch, model, optimizer, data_loader, grapher):
 
         # compute loss
         #loss.backward(retain_graph=True)
-        loss['loss'].backward()
+        loss['loss_mean'].backward()
         optimizer.step()
 
         # log every nth interval
         if batch_idx % args.log_interval == 0:
-            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}\tKLD: {:.4f}\tNLL: {:.4f}'.format(
-                epoch, batch_idx * len(data), len(data_loader.train_loader.dataset),
-                100. * batch_idx / len(data_loader.train_loader),
-                loss['loss'].data[0], loss['kld'].data[0], loss['nll'].data[0]))
+            # the total number of samples is different
+            # if we have filtered using the class_sampler
+            if hasattr(data_loader.train_loader, "sampler") \
+               and hasattr(data_loader.train_loader.sampler, "num_samples"):
+                num_samples = data_loader.train_loader.sampler.num_samples
+            else:
+                num_samples = len(data_loader.train_loader)
 
-            grapher.register_single({'train_loss': [[TOTAL_ITER], [loss['loss'].data[0]]]},
+            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}\tKLD: {:.4f}\tNLL: {:.4f}'.format(
+                epoch, batch_idx * len(data), num_samples,
+                100. * batch_idx * len(data) / num_samples,
+                loss['loss_mean'].data[0], loss['kld_mean'].data[0], loss['nll_mean'].data[0]))
+
+            grapher.register_single({'train_loss': [[TOTAL_ITER], [loss['loss_mean'].data[0]]]},
                                     plot_type='line')
-            grapher.register_single({'train_kld': [[TOTAL_ITER], [loss['kld'].data[0]]]},
+            grapher.register_single({'train_kld': [[TOTAL_ITER], [loss['kld_mean'].data[0]]]},
                                     plot_type='line')
-            grapher.register_single({'train_nll': [[TOTAL_ITER], [loss['nll'].data[0]]]},
+            grapher.register_single({'train_nll': [[TOTAL_ITER], [loss['nll_mean'].data[0]]]},
+                                    plot_type='line')
+            grapher.register_single({'train_elbo': [[TOTAL_ITER], [loss['elbo_mean'].data[0]]]},
                                     plot_type='line')
             register_images(output_map['student']['x_reconstr'],
                             output_map['augmented']['data'],
@@ -153,9 +166,10 @@ def register_images(reconstr_x, data, grapher, prefix="train"):
 
 def test(epoch, model, data_loader, grapher):
     model.eval()
-    test_loss = 0.
-    test_kld = 0.
-    test_nll = 0.
+    test_loss = []
+    test_kld = []
+    test_nll = []
+    test_elbo = []
 
     for data, target in data_loader.test_loader:
         if args.cuda:
@@ -167,13 +181,16 @@ def test(epoch, model, data_loader, grapher):
 
         output_map = model(data)
         loss_t = model.loss_function(output_map) # vae loss terms
-        test_loss += loss_t['loss'].data[0]
-        test_kld += loss_t['kld'].data[0]
-        test_nll += loss_t['nll'].data[0]
+        test_loss += [loss_t['loss_mean'].data[0]]
+        test_kld += [loss_t['kld_mean'].data[0]]
+        test_nll += [loss_t['nll_mean'].data[0]]
+        test_elbo += [loss_t['elbo_mean'].data[0]]
 
-    test_loss /= len(data_loader.test_loader)
-    test_kld /= len(data_loader.test_loader)
-    test_nll /= len(data_loader.test_loader)
+    test_nll = np.mean(test_nll)
+    test_kld = np.mean(test_kld)
+    test_loss = np.mean(test_loss)
+    test_elbo = np.mean(test_elbo)
+
     print('\nTest set: Average loss: {:.4f}\tKLD: {:.4f}\tNLL: {:.4f}\n'.format(
         test_loss, test_kld, test_nll))
 
@@ -181,6 +198,7 @@ def test(epoch, model, data_loader, grapher):
     grapher.register_single({'test_loss': [[epoch], [test_loss]]}, plot_type='line')
     grapher.register_single({'test_kld': [[epoch], [test_kld]]}, plot_type='line')
     grapher.register_single({'test_nll': [[epoch], [test_nll]]}, plot_type='line')
+    grapher.register_single({'test_elbo': [[epoch], [test_elbo]]}, plot_type='line')
     register_images(output_map['student']['x_reconstr'],
                     output_map['augmented']['data'],
                     grapher, 'test')
@@ -199,37 +217,58 @@ def generate(model, grapher):
     grapher.register_single({'generated': gen}, plot_type='imgs')
 
 
+def get_samplers(num_classes):
+    ''' builds samplers taking into account previous classes'''
+    test_samplers = []
+    for i in range(num_classes):
+        numbers = list(range(i + 1)) if i > 0 else 0
+        test_samplers.append(lambda x, j=numbers: ClassSampler(x, class_number=j))
+
+    train_samplers = [lambda x, j=j: ClassSampler(x, class_number=j)
+                      for j in range(num_classes)]
+    return train_samplers, test_samplers
+
 def get_model_and_loader():
     ''' helper to return the model and the loader '''
     # we build 10 samplers as all of the below have 10 classes
-    samplers = [lambda x, i=i: ClassSampler(x, class_number=i) for i in range(10)]
+    train_samplers, test_samplers = get_samplers(num_classes=10)
 
     if args.task == 'cifar10':
         loaders = [CIFAR10Loader(path=args.data_dir,
                                  batch_size=args.batch_size,
-                                 sampler=s,
-                                 use_cuda=args.cuda) for s in samplers]
+                                  train_sampler=tr,
+                                  test_sampler=te,
+                                 use_cuda=args.cuda)
+                   for tr, te in zip(train_samplers, test_samplers)]
     elif args.task == 'mnist':
         loaders = [MNISTLoader(path=args.data_dir,
                                batch_size=args.batch_size,
-                               sampler=s,
-                               use_cuda=args.cuda) for s in samplers]
+                               train_sampler=tr,
+                               test_sampler=te,
+                               use_cuda=args.cuda)
+                   for tr, te in zip(train_samplers, test_samplers)]
     elif args.task == 'clutter':
         loaders = [ClutteredMNISTLoader(path=args.data_dir,
                                         batch_size=args.batch_size,
-                                        sampler=s,
-                                        use_cuda=args.cuda) for s in samplers]
+                                        train_sampler=tr,
+                                        test_sampler=te,
+                                        use_cuda=args.cuda)
+                   for tr, te in zip(train_samplers, test_samplers)]
 
     elif args.task == 'svhn':
         loaders = [SVHNCenteredLoader(path=args.data_dir,
                                       batch_size=args.batch_size,
-                                      sampler=s,
-                                      use_cuda=args.cuda) for s in samplers]
+                                      train_sampler=tr,
+                                      test_sampler=te,
+                                      use_cuda=args.cuda)
+                   for tr, te in zip(train_samplers, test_samplers)]
     elif args.task == 'svhn_centered':
         loaders = [SVHNFullLoader(path=args.data_dir,
                                   batch_size=args.batch_size,
-                                  sampler=s,
-                                  use_cuda=args.cuda) for s in samplers]
+                                  train_sampler=tr,
+                                  test_sampler=te,
+                                  use_cuda=args.cuda)
+                   for tr, te in zip(train_samplers, test_samplers)]
     else:
         raise Exception("unknown dataset provided / not supported yet")
 
@@ -265,7 +304,7 @@ def run(args):
     lazy_generate_modules(model, data_loaders[0].img_shp)
 
     # collect our optimizer
-    optimizer = build_optimizer(model)
+    optimizer = build_optimizer(model.student)
 
     # main training loop
     for j, loader in enumerate(data_loaders):
@@ -282,7 +321,7 @@ def run(args):
             # a new optimizer
             model.fork()
             lazy_generate_modules(model, data_loaders[0].img_shp)
-            optimizer = build_optimizer(model)
+            optimizer = build_optimizer(model.student)
             grapher = Grapher(env=model.get_name(),
                               server=args.visdom_url,
                               port=args.visdom_port)

@@ -25,14 +25,10 @@ class IsotropicGaussian(nn.Module):
         )
 
     def _reparametrize_gaussian(self, mu, logvar):
-#        if self.training:
-            std = logvar.mul(0.5).exp_()
-            #std = logvar.sqrt()
-            eps = float_type(self.config['cuda'])(std.size()).normal_()
-            eps = Variable(eps)
-            return eps.mul(std).add_(mu), {'mu': mu, 'logvar': logvar}
-
- #       return mu, {'mu': mu, 'logvar': logvar}
+        std = logvar.mul(0.5).exp_()
+        eps = float_type(self.config['cuda'])(std.size()).normal_()
+        eps = Variable(eps)
+        return eps.mul(std).add_(mu), {'mu': mu, 'logvar': logvar}
 
     def reparmeterize(self, logits):
         feature_size = logits.size(-1)
@@ -48,21 +44,19 @@ class IsotropicGaussian(nn.Module):
         # Kingma and Welling. Auto-Encoding Variational Bayes. ICLR, 2014
         # https://arxiv.org/abs/1312.6114
         # 0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
-
-        kld_element = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-        kld_element /= batch_size * feat_size
+        # kld_element = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+        kld_element = -0.5 * torch.sum(1.0 + logvar - mu.pow(2)
+                                       - logvar.exp() - F.softplus(logvar), dim=-1)
+        #kld_element /= batch_size * feat_size
         return kld_element
-
-        # kld_element = mu.pow(2).add_(logvar.exp()).mul_(-1).add_(1).add_(logvar)
-        # #return torch.mean(kld_element).mul_(-0.5)
-        # return torch.sum(kld_element).mul_(-0.5)
 
     def kl(self, dist_a):
         return IsotropicGaussian._kld_gaussian_N_0_1(
-            dist_a['mu'], dist_a['logvar'],
-            batch_size=dist_a['mu'].size(0),
+            dist_a['gaussian']['mu'], dist_a['gaussian']['logvar'],
+            batch_size=dist_a['gaussian']['mu'].size(0),
             feat_size=int(np.prod(self.config['img_shp']))
         )
 
     def forward(self, logits):
-        return self.reparmeterize(logits)
+        z, gauss_params = self.reparmeterize(logits)
+        return z, { 'z': z, 'gaussian':  gauss_params }

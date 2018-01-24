@@ -107,7 +107,9 @@ class VAE(nn.Module):
                 nn.BatchNorm2d(self.config['filter_depth']*16),
                 self.activation_fn(inplace=True),
                 # state dim: 512 x 1 x 1
-                nn.Conv2d(self.config['filter_depth']*16, self.reparameterizer.input_size, 1, stride=1, bias=True)
+                nn.Conv2d(self.config['filter_depth']*16, self.reparameterizer.input_size, 1, stride=1, bias=True),
+                nn.BatchNorm2d(self.reparameterizer.input_size),
+                self.activation_fn(inplace=True)
                 # output dim: opt.z_dim x 1 x 1
             )
         elif self.config['layer_type'] == 'dense':
@@ -197,8 +199,8 @@ class VAE(nn.Module):
             # build a simple linear projector
             setattr(self, name, nn.Sequential(
                 View([-1, input_size]),
-                nn.BatchNorm1d(input_size),
-                self.activation_fn(),
+                # nn.BatchNorm1d(input_size),
+                # self.activation_fn(),
                 nn.Linear(input_size, output_size)
             ))
 
@@ -240,9 +242,7 @@ class VAE(nn.Module):
         #                       self.reparameterizer.output_size, 'dec_proj')
         # z_proj = self.dec_proj(z)
 
-        # logits = self.decoder(z_proj)
         logits = self.decoder(z.contiguous())
-        #return self._nll_activation(logits)
         return logits
 
     def forward(self, x):
@@ -251,22 +251,24 @@ class VAE(nn.Module):
         z, params = self.reparameterize(z_logits)
         return self.decode(z), params
 
-    def nll(self, recon_x, x, params):
-        if self.config['nll_type'] == "gaussian":
-            raise NotImplementedError("gaussian nll not working currently")
-            return self.nll_gaussian(recon_x, x,
-                                     params['mu'],
-                                     params['logvar'])
-        elif self.config['nll_type'] == "bernoulli":
-            return self.nll_bernoulli(recon_x, x)
-        else:
-            raise Exception("Unknown NLL")
+    def nll(self, recon_x, x):
+        nll_map = {
+            "gaussian": self.nll_gaussian,
+            "bernoulli": self.nll_bernoulli
+        }
+        return nll_map[self.config['nll_type']](recon_x, x)
 
-    def nll_bernoulli(self, recon_x_logits, x, size_average=True):
-        return F.binary_cross_entropy_with_logits(recon_x_logits, x,
-                                                  size_average=size_average)
+    def nll_bernoulli(self, recon_x_logits, x):
+        assert x.size() == recon_x_logits.size()
+        batch_size = recon_x_logits.size(0)
+        recon_x_logits = recon_x_logits.view(batch_size, -1)
+        x = x.view(batch_size, -1)
+        max_val = (-recon_x_logits).clamp(min=0)
+        nll = recon_x_logits - recon_x_logits * x \
+              + max_val + ((-max_val).exp() + (-recon_x_logits - max_val).exp()).log()
+        return torch.sum(nll, dim=-1)
 
-    def nll_gaussian(self, recon_x, x, mu, logvar):
+    def nll_gaussian(self, recon_x_logits, x, logvar=1):
         # Helpers to get the gaussian log-likelihood
         # pulled from tensorflow
         # (https://github.com/tensorflow/tensorflow/blob/r1.2/tensorflow/python/ops/distributions/normal.py)
@@ -280,8 +282,8 @@ class VAE(nn.Module):
         def _log_normalization(self, scale, eps=1e-9):
             return torch.log(scale + eps) + 0.5 * np.log(2. * np.pi)
 
-        return self._log_unnormalized_prob(x, mu, logvar) \
-            - self._log_normalization(logvar)
+        return self._log_unnormalized_prob(x, mu=recon_x_logits, logvar=logvar) \
+            - self._log_normalization(logvar=logvar)
 
     def kld(self, dist_a):
         ''' accepts param maps for dist_a and dist_b,
@@ -291,7 +293,7 @@ class VAE(nn.Module):
     def loss_function(self, recon_x, x, params):
         # tf: elbo = -log_likelihood + latent_kl
         # tf: cost = elbo + consistency_kl - self.mutual_info_reg * mutual_info_regularizer
-        nll = self.nll(recon_x, x, params)
+        nll = self.nll(recon_x, x)
         kld = self.kld(params)
         elbo = nll + kld
         mut_info = 0.0
@@ -304,8 +306,9 @@ class VAE(nn.Module):
         return {
             #'loss': nll + kld + self.config['mut_reg'] * mut_info,
             'loss': elbo - self.config['mut_reg'] * mut_info,
-            'elbo': elbo,
-            'nll': nll,
-            'kld': kld,
-            'mut_info': mut_info,
+            'loss_mean': torch.mean(elbo - self.config['mut_reg'] * mut_info),
+            'elbo_mean': torch.mean(elbo),
+            'nll_mean': torch.mean(nll),
+            'kld_mean': torch.mean(kld),
+            'mut_info_mean': torch.mean(mut_info) if not isinstance(mut_info, float) else mut_info,
         }

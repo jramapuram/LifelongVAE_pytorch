@@ -41,12 +41,12 @@ class Mixture(nn.Module):
         return torch.cat([cont, disc], 1)
 
     def mutual_info(self, params, eps=1e-9):
-        q_z_given_x = params['discrete']['q_z']
-        p_z = self.discrete.prior(q_z_given_x.size())
-        crossent_loss = torch.mean(-torch.sum(torch.log(q_z_given_x + eps) * p_z, dim=1))
-        ent_loss = torch.mean(-torch.sum(torch.log(p_z + eps) * p_z, dim=1))
-        # crossent_loss = torch.sum(-torch.sum(p_z * torch.log(q_z_given_x + eps), dim=1))
-        # ent_loss = torch.sum(-torch.sum(p_z * torch.log(p_z + eps), dim=1))
+        log_q_z_given_x = params['discrete']['log_q_z']
+        p_z = self.discrete.prior(log_q_z_given_x.size())
+        # crossent_loss = torch.mean(-torch.sum(torch.log(q_z_given_x + eps) * p_z, dim=1))
+        # ent_loss = torch.mean(-torch.sum(torch.log(p_z + eps) * p_z, dim=1))
+        crossent_loss = -torch.sum(log_q_z_given_x * p_z, dim=1)
+        ent_loss = -torch.sum(torch.log(p_z + eps) * p_z, dim=1)
         return crossent_loss + ent_loss
 
     def reparmeterize(self, logits):
@@ -57,14 +57,14 @@ class Mixture(nn.Module):
         discrete_reparam, disc_params = self.discrete(discrete_logits)
 
         merged = torch.cat([gaussian_reparam, discrete_reparam], -1)
-        params = {'gaussian': gauss_params,
-                  'discrete': disc_params,
+        params = {'gaussian': gauss_params['gaussian'],
+                  'discrete': disc_params['discrete'],
                   'z': merged}
         return merged, params
 
     def kl(self, dist_a):
-        gauss_kl = self.gaussian.kl(dist_a['gaussian'])
-        disc_kl = self.discrete.kl(dist_a['discrete'])
+        gauss_kl = self.gaussian.kl(dist_a)
+        disc_kl = self.discrete.kl(dist_a)
         # print("disc = ", dist_a['discrete']['q_z'].size(),
         #       " | gauss = ", dist_a['gaussian']['mu'].size(),
         #       " | kldisc = ", disc_kl.size(),

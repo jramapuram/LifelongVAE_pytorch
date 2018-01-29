@@ -299,7 +299,7 @@ class VAE(nn.Module):
         kld = self.kld(params)
         elbo = nll + kld
         mut_info = Variable(
-            float_type(self.config['cuda'])(x.size(0))
+            float_type(self.config['cuda'])(x.size(0)).zero_()
         )
 
         # add the mutual information regularizer if

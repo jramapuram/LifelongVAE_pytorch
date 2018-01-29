@@ -3,10 +3,11 @@ import pprint
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.distributions as D
 import torch.nn.functional as F
 from torch.autograd import Variable
 
-from helpers.utils import float_type
+from helpers.utils import float_type, zeros_like, ones_like
 from models.layers import View, Identity
 
 
@@ -40,6 +41,10 @@ class IsotropicGaussian(nn.Module):
 
     @staticmethod
     def _kld_gaussian_N_0_1(mu, logvar, feat_size, batch_size):
+        # standard_normal = D.Normal(zeros_like(mu), ones_like(logvar))
+        # normal = D.Normal(mu, logvar)
+        # return torch.sum(D.kl_divergence(normal, standard_normal), dim=-1)
+
         # see Appendix B from VAE paper:
         # Kingma and Welling. Auto-Encoding Variational Bayes. ICLR, 2014
         # https://arxiv.org/abs/1312.6114

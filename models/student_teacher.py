@@ -21,29 +21,43 @@ def detach_from_graph(param_map):
             v = v.detach_()
 
 
-def kl_categorical_categorical(dist_a, dist_b, from_index=0, cuda=False):
-    # https://github.com/tensorflow/tensorflow/blob/r1.1/tensorflow/contrib/distributions/python/ops/categorical.py
-    dist_a_log_softmax = F.log_softmax(dist_a['logits'][from_index:], dim=-1)
-    dist_a_softmax = F.softmax(dist_a['logits'][from_index:], dim=-1)
-    dist_b_log_softmax = F.log_softmax(dist_b['logits'][from_index:], dim=-1)
+# def kl_categorical_categorical(dist_a, dist_b, from_index=0, cuda=False):
+#     # https://github.com/tensorflow/tensorflow/blob/r1.1/tensorflow/contrib/distributions/python/ops/categorical.py
+#     dist_a_log_softmax = F.log_softmax(dist_a['logits'][from_index:], dim=-1)
+#     dist_a_softmax = F.softmax(dist_a['logits'][from_index:], dim=-1)
+#     dist_b_log_softmax = F.log_softmax(dist_b['logits'][from_index:], dim=-1)
 
-    # zero pad the smaller categorical
-    dist_a_log_softmax, dist_b_log_softmax \
-        = zero_pad_smaller_cat(dist_a_log_softmax,
-                               dist_b_log_softmax,
-                               cuda=cuda)
-    dist_a_softmax, dist_b_log_softmax \
+#     # zero pad the smaller categorical
+#     dist_a_log_softmax, dist_b_log_softmax \
+#         = zero_pad_smaller_cat(dist_a_log_softmax,
+#                                dist_b_log_softmax,
+#                                cuda=cuda)
+#     dist_a_softmax, dist_b_log_softmax \
+#         = zero_pad_smaller_cat(dist_a_softmax,
+#                                dist_b_log_softmax,
+#                                cuda=cuda)
+#     delta_log_probs1 = dist_a_log_softmax - dist_b_log_softmax
+#     return torch.sum(dist_a_softmax * delta_log_probs1, dim=-1)
+
+
+def kl_categorical_categorical(dist_a, dist_b, from_index=0, cuda=False):
+    # dist_a_logits, dist_b_logits \
+    #     = zero_pad_smaller_cat(dist_a['logits'][from_index:],
+    #                            dist_b['logits'][from_index:],
+    #                            cuda=cuda)
+    dist_a_softmax = F.softmax(dist_a['logits'][from_index:], dim=-1)
+    dist_b_softmax = F.softmax(dist_b['logits'][from_index:], dim=-1)
+    dist_a_softmax, dist_b_softmax \
         = zero_pad_smaller_cat(dist_a_softmax,
-                               dist_b_log_softmax,
+                               dist_b_softmax,
                                cuda=cuda)
-    delta_log_probs1 = dist_a_log_softmax - dist_b_log_softmax
-    return torch.sum(dist_a_softmax * delta_log_probs1, dim=-1)
+    return torch.sum(dist_a_softmax * torch.log(dist_a_softmax / (dist_b_softmax + 1e-9)), dim=-1)
 
 
 def kl_isotropic_gauss_gauss(dist_a, dist_b, eps=1e-9):
     # https://github.com/tensorflow/tensorflow/blob/r1.1/tensorflow/contrib/distributions/python/ops/normal.py
     sigma_a_sq = dist_a['logvar'].pow(2)
-    sigma_b_sq = dist_b['logvar'].pow(2)
+    sigma_b_sq = dist_b['logvar'].pow(2) + eps
     ratio = sigma_a_sq / sigma_b_sq
     return torch.sum(torch.pow(dist_a['mu'] - dist_b['mu'], 2) / (2 * sigma_b_sq)
                      + 0.5 * (ratio - 1 - torch.log(ratio + eps)), dim=-1)
@@ -96,6 +110,7 @@ class StudentTeacher(nn.Module):
                                               from_index=self.num_student_samples,
                                               cuda=self.config['cuda'])
         elif 'gaussian' in q_z_given_x_s and 'gaussian' in q_z_given_x_t:
+            # gauss kl-kl doesnt have any from-index
             return kl_isotropic_gauss_gauss(q_z_given_x_s['gaussian'],
                                             q_z_given_x_t['gaussian'])
         else:
@@ -117,6 +132,7 @@ class StudentTeacher(nn.Module):
                                         prepend=True,
                                         cuda=self.config['cuda'])
             vae_loss['loss'] = torch.mean(vae_loss['loss'] + posterior_regularizer)
+            #vae_loss['loss'] = torch.mean(vae_loss['loss']) + posterior_regularizer
             vae_loss['posterior_regularizer_mean'] = torch.mean(posterior_regularizer)
 
         return vae_loss
@@ -137,18 +153,18 @@ class StudentTeacher(nn.Module):
     def fork(self):
         config_copy = deepcopy(self.student.config)
         config_copy['discrete_size'] += 1
-        #self.teacher = deepcopy(self.student)
+        self.teacher = deepcopy(self.student)
 
-        self.teacher = VAE(input_shape=self.student.input_shape,
-                           **{'kwargs': self.student.config}
-        )
-        data = float_type(self.config['cuda'])(self.student.config['batch_size'],
-                                               *self.student.input_shape).normal_()
-        self.teacher(Variable(data))
-        self.student, self.teacher \
-            = self.copy_model(self.student,
-                              self.teacher)#,
-                              #disable_dst_grads=True)
+        # self.teacher = VAE(input_shape=self.student.input_shape,
+        #                    **{'kwargs': self.student.config}
+        # )
+        # data = float_type(self.config['cuda'])(self.student.config['batch_size'],
+        #                                        *self.student.input_shape).normal_()
+        # self.teacher(Variable(data))
+        # self.student, self.teacher \
+        #     = self.copy_model(self.student,
+        #                       self.teacher,
+        #                       disable_dst_grads=True)
 
         # student_params = list(self.student.parameters())
         # teacher_params = list(self.teacher.parameters())
@@ -159,11 +175,16 @@ class StudentTeacher(nn.Module):
         self.student = VAE(input_shape=self.teacher.input_shape,
                            **{'kwargs': config_copy}
         )
-        data = float_type(self.config['cuda'])(self.student.config['batch_size'],
-                                               *self.student.input_shape).normal_()
-        self.student(Variable(data))
-        self.teacher, self.student \
-            = self.copy_model(self.teacher, self.student, disable_dst_grads=False)
+
+        # forward pass once to build lazy modules
+        # data = float_type(self.config['cuda'])(self.student.config['batch_size'],
+        #                                        *self.student.input_shape).normal_()
+        # self.student(Variable(data))
+
+        # # copy teacher params into student while
+        # # increasing the dimensionality of the projection
+        # self.teacher, self.student \
+        #     = self.copy_model(self.teacher, self.student, disable_dst_grads=False)
 
         # copy the teacher weights into the student model
         # for student_param, teacher_param in zip(self.student.parameters(),

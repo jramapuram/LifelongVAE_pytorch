@@ -89,8 +89,10 @@ class Grapher(object):
     def _plot_hist(self, hist_list):
         for hist_map in hist_list:
             for key, value in hist_map.items():
-                self.vis.histogram(to_data(value),
-                                   opts=dict(title=key),
+                numbins = value[0]
+                hist_value = value[1]
+                self.vis.histogram(hist_value,
+                                   opts=dict(title=key, numbins=numbins),
                                    win=key)
 
     def _plot_video(self, video_list):

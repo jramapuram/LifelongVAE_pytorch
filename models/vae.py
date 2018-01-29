@@ -49,8 +49,10 @@ class VAE(nn.Module):
         if self.config['reparam_type'] == "mixture":
             param_str = "_disc" + str(self.config['discrete_size']) + \
                         "_cont" + str(self.config['continuous_size'])
-        else:
-            param_str = "latent" + str(self.config['continuous_size'])
+        elif self.config['reparam_type'] == "isotropic_gaussian":
+            param_str = "_cont" + str(self.config['continuous_size'])
+        elif self.config['reparam_type'] == "discrete":
+            param_str = "_disc" + str(self.config['discrete_size'])
 
         full_hash_str = "_input" + str(self.input_shape) + \
                         param_str + \
@@ -296,19 +298,20 @@ class VAE(nn.Module):
         nll = self.nll(recon_x, x)
         kld = self.kld(params)
         elbo = nll + kld
-        mut_info = 0.0
+        mut_info = Variable(
+            float_type(self.config['cuda'])(x.size(0))
+        )
 
         # add the mutual information regularizer if
         # running a mixture model ONLY
         if self.config['reparam_type'] == 'mixture':
-            mut_info += self.reparameterizer.mutual_info(params)
+            mut_info = self.reparameterizer.mutual_info(params)
 
         return {
-            #'loss': nll + kld + self.config['mut_reg'] * mut_info,
             'loss': elbo - self.config['mut_reg'] * mut_info,
             'loss_mean': torch.mean(elbo - self.config['mut_reg'] * mut_info),
             'elbo_mean': torch.mean(elbo),
             'nll_mean': torch.mean(nll),
             'kld_mean': torch.mean(kld),
-            'mut_info_mean': torch.mean(mut_info) if not isinstance(mut_info, float) else mut_info,
+            'mut_info_mean': torch.mean(mut_info)
         }

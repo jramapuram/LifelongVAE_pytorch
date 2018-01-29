@@ -121,7 +121,6 @@ def train(epoch, model, optimizer, data_loader, grapher):
         loss = model.loss_function(output_map) # vae loss terms
 
         # compute loss
-        #loss.backward(retain_graph=True)
         loss['loss_mean'].backward()
         optimizer.step()
 
@@ -140,14 +139,7 @@ def train(epoch, model, optimizer, data_loader, grapher):
                 100. * batch_idx * len(data) / num_samples,
                 loss['loss_mean'].data[0], loss['kld_mean'].data[0], loss['nll_mean'].data[0]))
 
-            grapher.register_single({'train_loss': [[TOTAL_ITER], [loss['loss_mean'].data[0]]]},
-                                    plot_type='line')
-            grapher.register_single({'train_kld': [[TOTAL_ITER], [loss['kld_mean'].data[0]]]},
-                                    plot_type='line')
-            grapher.register_single({'train_nll': [[TOTAL_ITER], [loss['nll_mean'].data[0]]]},
-                                    plot_type='line')
-            grapher.register_single({'train_elbo': [[TOTAL_ITER], [loss['elbo_mean'].data[0]]]},
-                                    plot_type='line')
+            register_plots(model, loss, output_map, grapher)
             register_images(output_map['student']['x_reconstr'],
                             output_map['augmented']['data'],
                             grapher)
@@ -155,6 +147,30 @@ def train(epoch, model, optimizer, data_loader, grapher):
 
 
         TOTAL_ITER += 1
+
+
+def register_plots(model, loss, output_map, grapher, prefix='train'):
+    grapher.register_single({'%s_loss' % prefix: [[TOTAL_ITER], [loss['loss_mean'].data[0]]]},
+                            plot_type='line')
+    grapher.register_single({'%s_kld' % prefix: [[TOTAL_ITER], [loss['kld_mean'].data[0]]]},
+                            plot_type='line')
+    grapher.register_single({'%s_nll' % prefix: [[TOTAL_ITER], [loss['nll_mean'].data[0]]]},
+                            plot_type='line')
+    grapher.register_single({'%s_elbo' % prefix: [[TOTAL_ITER], [loss['elbo_mean'].data[0]]]},
+                            plot_type='line')
+    grapher.register_single({'%s_elbo' % prefix: [[TOTAL_ITER], [loss['elbo_mean'].data[0]]]},
+                            plot_type='line')
+
+    # register the mean of the discrete value
+    # TODO: visualize a histogram
+    if 'discrete' in output_map['student']['params']:
+        zhard_sum = torch.sum(
+            output_map['student']['params']['discrete']['z_hard'], dim=0
+        ).data.cpu().numpy()
+        if len(zhard_sum) > 1:
+            num_discrete = model.student.reparameterizer.config['discrete_size']
+            grapher.register_single({'%s_zhard' % prefix: [num_discrete, zhard_sum]},
+                                    plot_type='hist')
 
 
 def register_images(reconstr_x, data, grapher, prefix="train"):
@@ -205,16 +221,18 @@ def test(epoch, model, data_loader, grapher):
     grapher.show()
 
 
-def generate(model, grapher):
-    model.eval()
-    # gen = model.student.reparameterizer.prior(
-    #     [args.batch_size, model.student.reparameterizer.output_size]
-    # )
-    # gen =  model.student.nll_activation(model.student.decode(gen))
-    gen = model.generate_synthetic_samples(model.student,
-                                           args.batch_size)
-    gen = torch.min(gen, ones_like(gen, args.cuda))
-    grapher.register_single({'generated': gen}, plot_type='imgs')
+def generate(student_teacher, grapher, name='teacher'):
+    model = {
+        'teacher': student_teacher.teacher,
+        'student': student_teacher.student
+    }
+
+    if model[name] is not None:
+        model[name].eval()
+        gen = student_teacher.generate_synthetic_samples(model[name],
+                                                         args.batch_size)
+        gen = torch.min(gen, ones_like(gen, args.cuda))
+        grapher.register_single({'generated_%s'%name: gen}, plot_type='imgs')
 
 
 def get_samplers(num_classes):
@@ -289,8 +307,32 @@ def get_model_and_loader():
     return [student_teacher, loaders, grapher]
 
 
+def estimate_fisher(model, data_loader, sample_size=1024):
+    # modified from github user kuc2477
+    # sample loglikelihoods from the dataset.
+    loglikelihoods = []
+    for x, y in data_loader:
+        x = x.view(args.batch_size, -1)
+        x = Variable(x).cuda() if args.cuda else Variable(x)
+        y = Variable(y).cuda() if args.cuda else Variable(y)
+        loglikelihoods.append(
+            F.log_softmax(model(x))[range(args.batch_size), y.data]
+        )
+        if len(loglikelihoods) >= sample_size // args.batch_size:
+            break
+
+    # estimate the fisher information of the parameters.
+    loglikelihood = torch.cat(loglikelihoods).mean(0)
+    loglikelihood_grads = torch.autograd.grad(loglikelihood, model.parameters())
+    parameter_names = [
+        n.replace('.', '__') for n, p in model.named_parameters()
+    ]
+    return {n: g**2 for n, g in zip(parameter_names, loglikelihood_grads)}
+
+
 def lazy_generate_modules(model, img_shp):
     ''' Super hax, but needed for building lazy modules '''
+    model.eval()
     data = float_type(args.cuda)(args.batch_size, *img_shp).normal_()
     model(Variable(data))
 
@@ -313,7 +355,8 @@ def run(args):
         for epoch in range(1, num_epochs + 1):
             train(epoch, model, optimizer, loader, grapher)
             test(epoch, model, loader, grapher)
-            generate(model, grapher)
+            generate(model, grapher, 'student') # generate student samples
+            generate(model, grapher, 'teacher') # generate teacher samples
 
         if j != len(data_loaders) - 1:
             # spawn a new student & rebuild grapher

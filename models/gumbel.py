@@ -31,10 +31,9 @@ class GumbelSoftmax(nn.Module):
     def _setup_anneal_params(self):
         # setup the base gumbel rates
         # TODO: parameterize this
-        self.tau = 5.0
+        self.tau = 1.0
         self.tau0 = 1.0
-        self.tau_host = self.tau0
-        self.anneal_rate = 0.00003
+        self.anneal_rate = 0.0003
         # self.anneal_rate = 0.0003 #1e-5
         self.min_temp = 0.5
 
@@ -91,7 +90,7 @@ class GumbelSoftmax(nn.Module):
     def sample_gumbel(x, tau, hard=False, use_cuda=True):
         y = GumbelSoftmax._gumbel_softmax(x, tau, use_cuda=use_cuda)
 
-        if hard == True:
+        if hard:
             y_max, _ = torch.max(y, dim=y.dim() - 1,
                                  keepdim=True)
             y_hard = Variable(
@@ -101,7 +100,7 @@ class GumbelSoftmax(nn.Module):
             y_hard = y_hard_diff.detach() + y
             return y.view_as(x), y_hard.view_as(x)
 
-        return y.view_as(x)
+        return y.view_as(x), None
 
     def forward(self, logits):
         self.anneal()  # anneal first

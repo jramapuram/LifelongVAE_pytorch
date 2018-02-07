@@ -8,7 +8,6 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 
 from helpers.utils import float_type, ones_like
-from models.layers import View, Identity
 from models.gumbel import GumbelSoftmax
 from models.isotropic_gaussian import IsotropicGaussian
 
@@ -40,14 +39,13 @@ class Mixture(nn.Module):
         cont = self.gaussian.prior([batch_size, self.gaussian.output_size])
         return torch.cat([cont, disc], 1)
 
-    def mutual_info(self, params, eps=1e-9):
-        log_q_z_given_x = params['discrete']['log_q_z']
-        p_z = self.discrete.prior(log_q_z_given_x.size())
-        # crossent_loss = torch.mean(-torch.sum(torch.log(q_z_given_x + eps) * p_z, dim=1))
-        # ent_loss = torch.mean(-torch.sum(torch.log(p_z + eps) * p_z, dim=1))
-        crossent_loss = -torch.sum(log_q_z_given_x * p_z, dim=1)
-        ent_loss = -torch.sum(torch.log(p_z + eps) * p_z, dim=1)
-        return crossent_loss + ent_loss
+    def mutual_info(self, params):
+        return self.discrete.mutual_info(params)
+
+    def log_likelihood(self, z, params):
+        cont = self.gaussian.log_likelihood(z[:, 0:self.gaussian.output_size], params)
+        disc = self.discrete.log_likelihood(z[:, self.gaussian.output_size:], params)
+        return torch.cat([cont, disc], 1)
 
     def reparmeterize(self, logits):
         gaussian_logits = logits[:, 0:self.num_continuous_input]
@@ -55,8 +53,8 @@ class Mixture(nn.Module):
 
         gaussian_reparam, gauss_params = self.gaussian(gaussian_logits)
         discrete_reparam, disc_params = self.discrete(discrete_logits)
-
         merged = torch.cat([gaussian_reparam, discrete_reparam], -1)
+
         params = {'gaussian': gauss_params['gaussian'],
                   'discrete': disc_params['discrete'],
                   'z': merged}
@@ -65,11 +63,7 @@ class Mixture(nn.Module):
     def kl(self, dist_a):
         gauss_kl = self.gaussian.kl(dist_a)
         disc_kl = self.discrete.kl(dist_a)
-        # print("disc = ", dist_a['discrete']['q_z'].size(),
-        #       " | gauss = ", dist_a['gaussian']['mu'].size(),
-        #       " | kldisc = ", disc_kl.size(),
-        #       " | klgauss = ", gauss_kl.size())
-        return gauss_kl + disc_kl
+        return torch.cat([gauss_kl, disc_kl], dim=1)
 
     def forward(self, logits):
         return self.reparmeterize(logits)

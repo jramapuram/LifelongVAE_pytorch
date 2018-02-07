@@ -1,7 +1,10 @@
+import os
 import torch
 import torch.nn as nn
 import numpy as np
+import scipy as sp
 import torch.nn.functional as F
+import torch.distributions as D
 from torch.autograd import Variable
 
 
@@ -37,6 +40,13 @@ def squeeze_expand_dim(tensor, axis):
         return tensor.unsqueeze(axis)
     else:
         return tensor
+
+
+def invert_shuffle(arr, perm):
+    for _ in range(arr.size(0) - 1):
+        arr = arr[perm]
+
+    return arr
 
 
 def normalize_images(imgs, mu=None, sigma=None, eps=1e-9):
@@ -76,6 +86,19 @@ def normalize_images(imgs, mu=None, sigma=None, eps=1e-9):
 
     return (imgs - mu) / (sigma + eps), [mu, sigma]
 
+
+def num_samples_in_loader(data_loader):
+    ''' simple helper to return the correct number of samples
+        if we have used our class-splitter filter '''
+    if hasattr(data_loader, "sampler") \
+       and hasattr(data_loader.sampler, "num_samples"):
+        num_samples = data_loader.sampler.num_samples
+    else:
+        num_samples = len(data_loader.dataset)
+
+    return num_samples
+
+
 def normalize_train_test_images(train_imgs, test_imgs, eps=1e-9):
     ''' simple helper to take train and test images
         and normalize the test images by the train mu/sigma '''
@@ -84,6 +107,35 @@ def normalize_train_test_images(train_imgs, test_imgs, eps=1e-9):
     train_imgs , [mu, sigma] = normalize_images(train_imgs, eps=eps)
     return [train_imgs,
             (test_imgs - mu) / (sigma + eps)]
+
+
+def append_to_csv(data, filename):
+    with open(filename, 'ab') as f:
+        np.savetxt(f, data, delimiter=",")
+
+
+def frechet_gauss_gauss_np(synthetic_features, test_features):
+    # calculate the statistics required for frechet distance
+    # https://github.com/bioinf-jku/TTUR/blob/master/fid.py
+    mu_synthetic = np.mean(synthetic_features, axis=0)
+    sigma_synthetic = np.cov(synthetic_features, rowvar=False)
+    mu_test = np.mean(test_features, axis=0)
+    sigma_test = np.cov(test_features, rowvar=False)
+
+    m = np.square(mu_synthetic - mu_test).sum()
+    s = sp.linalg.sqrtm(np.dot(sigma_synthetic, sigma_test))
+    dist = m + np.trace(sigma_synthetic + sigma_synthetic - 2*s)
+    if np.isnan(dist):
+        raise Exception("nan occured in FID calculation.")
+
+    return dist
+
+
+def frechet_gauss_gauss(dist_a, dist_b):
+    ''' d^2 = ||mu_1 - mu_2||^2 + Tr(C_1 + C_2 - 2*sqrt(C_1*C_2)). '''
+    m = torch.pow(dist_a.loc - dist_b.loc, 2).sum()
+    s = torch.sqrt(dist_a.scale * dist_b.scale)
+    return torch.mean(m + dist_a.scale + dist_b.scale - 2*s)
 
 
 def zeros_like(tensor, cuda=False):
@@ -260,6 +312,12 @@ def str_to_activ(str_activ):
         return oneplus
     else:
         raise Exception("invalid activation provided")
+
+
+def check_or_create_dir(dir_path):
+    if not os.path.exists(dir_path):
+        os.makedirs(dir_path)
+
 
 def register_nan_checks(model):
     def check_grad(module, grad_input, grad_output):

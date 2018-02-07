@@ -4,17 +4,39 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributions as D
 from torch.autograd import Variable
+from collections import OrderedDict
 
-from models.layers import View, Identity, UpsampleConvLayer
+from models.layers import View, Identity, UpsampleConvLayer, flatten_layers
 from models.gumbel import GumbelSoftmax
 from models.mixture import Mixture
 from models.isotropic_gaussian import IsotropicGaussian
-from helpers.utils import float_type
+from helpers.utils import float_type, ones_like
+
+
+def log_logistic_256(x, mean, log_s, average=False, dim=None):
+    binsize = 1. / 256.
+    scale = torch.exp(log_s)
+    # make sure image fit proper values
+    x = torch.floor(x/binsize) * binsize
+    # calculate normalized values for a bin
+    x_plus = (x + binsize - mean) / scale
+    x_minus = (x - mean) / scale
+    # calculate logistic CDF for a bin
+    cdf_plus = F.sigmoid(x_plus)
+    cdf_minus = F.sigmoid(x_minus)
+    # calculate final log-likelihood for an image
+    log_logistic_256 = - torch.log(cdf_plus - cdf_minus + 1.e-7)
+
+    if average:
+        return torch.mean( log_logistic_256, dim )
+
+    return torch.sum( log_logistic_256, dim )
 
 
 class VAE(nn.Module):
-    def __init__(self, input_shape, activation_fn=nn.ReLU, **kwargs):
+    def __init__(self, input_shape, activation_fn=nn.ELU, **kwargs):
         super(VAE, self).__init__()
         self.input_shape = input_shape
         self.activation_fn = activation_fn
@@ -44,6 +66,7 @@ class VAE(nn.Module):
         # build the encoder and decoder
         self.encoder = self.build_encoder()
         self.decoder = self.build_decoder()
+        self.full_model = None
 
     def get_name(self):
         if self.config['reparam_type'] == "mixture":
@@ -54,14 +77,16 @@ class VAE(nn.Module):
         elif self.config['reparam_type'] == "discrete":
             param_str = "_disc" + str(self.config['discrete_size'])
 
-        full_hash_str = "_input" + str(self.input_shape) + \
+        full_hash_str = "_" + str(self.config['layer_type']) + \
+                        "_input" + str(self.input_shape) + \
                         param_str + \
                         "_batch" + str(self.config['batch_size']) + \
                         "_mut" + str(self.config['mut_reg']) + \
                         "_filter_depth" + str(self.config['filter_depth']) + \
                         "_nll" + str(self.config['nll_type']) + \
                         "_reparam" + str(self.config['reparam_type']) + \
-                        "_lr" + str(self.config['lr'])
+                        "_lr" + str(self.config['lr']) + \
+                        "_ngpu" + str(self.config['ngpu'])
 
         full_hash_str = full_hash_str.strip().lower().replace('[', '')  \
                                                      .replace(']', '')  \
@@ -73,11 +98,10 @@ class VAE(nn.Module):
                                                      .replace('(', '') \
                                                      .replace(')', '') \
                                                      .replace('\'', '')
-        return 'vae_' + self.config['task'] + full_hash_str
+        return 'vae_' + '_'.join(self.config['task']) + full_hash_str
 
     def build_encoder(self):
         ''' helper function to build convolutional encoder'''
-
         if self.config['layer_type'] == 'conv':
             # build an upsampler (possible downsampler in some cases) to 32x32
             bilinear_size = [32, 32]  # XXX: hard coded
@@ -117,13 +141,13 @@ class VAE(nn.Module):
         elif self.config['layer_type'] == 'dense':
             encoder = nn.Sequential(
                 View([-1, int(np.prod(self.input_shape))]),
-                nn.Linear(int(np.prod(self.input_shape)), self.reparameterizer.input_size),
-                nn.BatchNorm1d(self.reparameterizer.input_size),
+                nn.Linear(int(np.prod(self.input_shape)), 512),
+                nn.BatchNorm1d(512),
                 self.activation_fn(),
-                nn.Linear(self.reparameterizer.input_size, self.reparameterizer.input_size),
-                nn.BatchNorm1d(self.reparameterizer.input_size),
+                nn.Linear(512, 512),
+                nn.BatchNorm1d(512),
                 self.activation_fn(),
-                nn.Linear(self.reparameterizer.input_size, self.reparameterizer.input_size)
+                nn.Linear(512, self.reparameterizer.input_size)
                 # nn.BatchNorm1d(self.reparameterizer.input_size),
                 # self.activation_fn(),
             )
@@ -173,13 +197,13 @@ class VAE(nn.Module):
         elif self.config['layer_type'] == 'dense':
             decoder = nn.Sequential(
                 View([-1, self.reparameterizer.output_size]),
-                nn.Linear(self.reparameterizer.output_size, self.reparameterizer.output_size),
-                nn.BatchNorm1d(self.reparameterizer.output_size),
+                nn.Linear(self.reparameterizer.output_size, 512),
+                nn.BatchNorm1d(512),
                 self.activation_fn(),
-                nn.Linear(self.reparameterizer.output_size, self.reparameterizer.output_size),
-                nn.BatchNorm1d(self.reparameterizer.output_size),
+                nn.Linear(512, 512),
+                nn.BatchNorm1d(512),
                 self.activation_fn(),
-                nn.Linear(self.reparameterizer.output_size, int(np.prod(self.input_shape))),
+                nn.Linear(512, int(np.prod(self.input_shape))),
                 View([-1] + self.input_shape)
             )
         else:
@@ -219,8 +243,15 @@ class VAE(nn.Module):
         return self.reparameterizer(logits)
 
     def nll_activation(self, logits):
-        if self.config['nll_type'] == "gaussian":
-            return logits
+        if self.config['nll_type'] == "clamp":
+            num_half_chans = logits.size(1) // 2
+            logits_mu = logits[:, 0:num_half_chans, :, :]
+            return torch.clamp(logits_mu, min=0.+1./512., max=1.-1./512.)
+        elif self.config['nll_type'] == "gaussian":
+            num_half_chans = logits.size(1) // 2
+            logits_mu = logits[:, 0:num_half_chans, :, :]
+            #return F.sigmoid(logits_mu)
+            return logits_mu
         elif self.config['nll_type'] == "bernoulli":
             return F.sigmoid(logits)
         else:
@@ -238,14 +269,55 @@ class VAE(nn.Module):
                               name='enc_proj')
         return self.enc_proj(conv)
 
-    def decode(self, z):
-        # project via linear layer
-        # self._lazy_init_dense(self.reparameterizer.output_size,
-        #                       self.reparameterizer.output_size, 'dec_proj')
-        # z_proj = self.dec_proj(z)
+    def _project_decoder_for_variance(self, logits):
+        ''' if we have a nll with variance
+            then project it to the required dimensions '''
+        if self.config['nll_type'] == 'gaussian' \
+           or self.config['nll_type'] == 'clamp':
+            if not hasattr(self, 'decoder_projector'):
+                if self.config['layer_type'] == 'conv':
+                    self.decoder_projector = nn.Sequential(
+                        nn.BatchNorm2d(self.chans),
+                        self.activation_fn(inplace=True),
+                        nn.ConvTranspose2d(self.chans, self.chans*2, 1, stride=1, bias=False)
+                    )
+                else:
+                    input_flat = int(np.prod(self.input_shape))
+                    self.decoder_projector = nn.Sequential(
+                        View([-1, input_flat]),
+                        nn.BatchNorm1d(input_flat),
+                        self.activation_fn(inplace=True),
+                        nn.Linear(input_flat, input_flat*2, bias=True),
+                        View([-1, self.chans*2, *self.input_shape[1:]])
+                    )
 
-        logits = self.decoder(z.contiguous())
+                if self.config['cuda']:
+                    self.decoder_projector.cuda()
+
+            return self.decoder_projector(logits)
+
+        # bernoulli reconstruction
         return logits
+
+    def decode(self, z):
+        '''returns logits '''
+        logits = self.decoder(z.contiguous())
+        return self._project_decoder_for_variance(logits)
+
+    def compile_full_model(self):
+        '''NOTE: add decoder projection'''
+        if hasattr(self, 'enc_proj'):
+            if not self.full_model:
+                full_model_list, _ = flatten_layers(
+                    nn.Sequential(
+                        self.encoder,
+                        self.enc_proj,
+                        self.reparameterizer,
+                        self.decoder
+                    ))
+                self.full_model = nn.Sequential(OrderedDict(full_model_list))
+        else:
+            raise Exception("cant compile full model till you lazy-init the dense layer")
 
     def forward(self, x):
         ''' params is a map of the latent variable's parameters'''
@@ -256,41 +328,103 @@ class VAE(nn.Module):
     def nll(self, recon_x, x):
         nll_map = {
             "gaussian": self.nll_gaussian,
-            "bernoulli": self.nll_bernoulli
+            "bernoulli": self.nll_bernoulli,
+            "clamp": self.nll_clamp
         }
-        return nll_map[self.config['nll_type']](recon_x, x)
+        return nll_map[self.config['nll_type']](x, recon_x)
 
-    def nll_bernoulli(self, recon_x_logits, x):
-        assert x.size() == recon_x_logits.size()
-        batch_size = recon_x_logits.size(0)
-        recon_x_logits = recon_x_logits.view(batch_size, -1)
-        x = x.view(batch_size, -1)
-        max_val = (-recon_x_logits).clamp(min=0)
-        nll = recon_x_logits - recon_x_logits * x \
-              + max_val + ((-max_val).exp() + (-recon_x_logits - max_val).exp()).log()
-        return torch.sum(nll, dim=-1)
+    def nll_bernoulli(self, x, recon_x_logits):
+        batch_size = x.size(0)
+        nll = D.Bernoulli(logits=recon_x_logits.view(batch_size, -1)).log_prob(
+            x.view(batch_size, -1)
+        )
+        return -torch.sum(nll, dim=-1)
+        # assert x.size() == recon_x_logits.size()
+        # batch_size = recon_x_logits.size(0)
+        # recon_x_logits = recon_x_logits.view(batch_size, -1)
+        # x = x.view(batch_size, -1)
+        # max_val = (-recon_x_logits).clamp(min=0)
+        # nll = recon_x_logits - recon_x_logits * x \
+        #       + max_val + ((-max_val).exp() + (-recon_x_logits - max_val).exp()).log()
+        # return torch.sum(nll, dim=-1)
 
-    def nll_gaussian(self, recon_x_logits, x, logvar=1):
-        # Helpers to get the gaussian log-likelihood
-        # pulled from tensorflow
-        # (https://github.com/tensorflow/tensorflow/blob/r1.2/tensorflow/python/ops/distributions/normal.py)
-        def _z(self, x, loc, scale, eps=1e-9):
-            """Standardize input `x` to a unit normal."""
-            return (x - loc) / (scale + eps)
+    def nll_clamp(self, x, recon):
+        batch_size, num_half_chans = x.size(0), recon.size(1) // 2
+        recon_mu = recon[:, 0:num_half_chans, :, :]
+        recon_logvar = recon[:, num_half_chans:, :, :]
 
-        def _log_unnormalized_prob(self, x, loc, scale):
-            return -0.5 * torch.pow(self._z(x, loc, scale), 2)
+        # if recon_sigma is None:
+        #     recon_sigma = ones_like(recon_mu, self.config['cuda'])
 
-        def _log_normalization(self, scale, eps=1e-9):
-            return torch.log(scale + eps) + 0.5 * np.log(2. * np.pi)
+        return log_logistic_256(x.view(batch_size, -1),
+                                torch.clamp(recon_mu.view(batch_size, -1), min=0.+1./512., max=1.-1./512.),
+                                F.hardtanh(recon_logvar.view(batch_size, -1), min_val=-4.5, max_val=0),
+                                dim=-1)
 
-        return self._log_unnormalized_prob(x, mu=recon_x_logits, logvar=logvar) \
-            - self._log_normalization(logvar=logvar)
+    def nll_laplace(self, x, recon):
+        batch_size, num_half_chans = x.size(0), recon.size(1) // 2
+        recon_mu = recon[:, 0:num_half_chans, :, :]
+        recon_logvar = recon[:, num_half_chans:, :, :]
+        #recon_logvar = ones_like(recon_mu, self.config['cuda'])
+
+        nll = D.Laplace(
+            # recon_mu.view(batch_size, -1),
+            recon_mu.view(batch_size, -1),
+            # F.hardtanh(recon_logvar.view(batch_size, -1), min_val=-4.5, max_val=0) + 1e-6
+            recon_logvar.view(batch_size, -1)
+        ).log_prob(x.view(batch_size, -1))
+        return -torch.sum(nll, dim=-1)
+
+    def nll_gaussian(self, x, recon):
+        batch_size, num_half_chans = x.size(0), recon.size(1) // 2
+        recon_mu = recon[:, 0:num_half_chans, :, :]
+        recon_logvar = recon[:, num_half_chans:, :, :]
+
+        # if recon_logvar is None:
+        #     recon_logvar = ones_like(recon_mu, self.config['cuda'])
+
+        # XXX: currently broken
+        recon_logvar = ones_like(recon_mu, self.config['cuda'])
+
+        nll = D.Normal(
+            recon_mu.view(batch_size, -1),
+            #F.hardtanh(recon_logvar.view(batch_size, -1), min_val=-4.5, max_val=0) + 1e-6
+            recon_logvar.view(batch_size, -1)
+        ).log_prob(x.view(batch_size, -1))
+        return -torch.sum(nll, dim=-1)
+
+
+    # def nll_gaussian(self, recon_x_logits, x, logvar=1):
+    #     # Helpers to get the gaussian log-likelihood pulled from tensorflow
+    #     # (https://github.com/tensorflow/tensorflow/blob/r1.2/tensorflow/python/ops/distributions/normal.py)
+    #     def _z(x, loc, scale, eps=1e-9):
+    #         """Standardize input `x` to a unit normal."""
+    #         return (x - loc) / (scale + eps)
+
+    #     # return -0.5 * ( log_var + K.square( sample - mean ) / K.exp( log_var ) )
+    #     def _log_unnormalized_prob(x, loc, scale):
+    #         return -0.5 * torch.pow(_z(x, loc, scale), 2)
+
+    #     def _log_normalization(scale, eps=1e-9):
+    #         if isinstance(scale, (float, int, np.float32, np.float64)):
+    #             return np.log(scale + eps) + 0.5 * np.log(2. * np.pi)
+
+    #         return torch.log(scale + eps) + 0.5 * np.log(2. * np.pi)
+
+    #     batch_size = x.size(0)
+    #     xflat = x.view(batch_size, -1)
+    #     locflat = F.sigmoid(recon_x_logits.view(batch_size, -1))
+    #     scaleflat = logvar if isinstance(logvar, (float, int, np.float32, np.float64)) \
+    #                 else logvar.view(batch_size, -1)
+    #     normalized_prob = _log_normalization(scale=scaleflat)
+    #     unnormalized_prob = _log_unnormalized_prob(xflat, loc=locflat, scale=scaleflat)
+    #     nll = unnormalized_prob - normalized_prob
+    #     return torch.sum(nll, dim=-1)
 
     def kld(self, dist_a):
         ''' accepts param maps for dist_a and dist_b,
             TODO: make generic and accept two distributions'''
-        return self.reparameterizer.kl(dist_a)
+        return torch.sum(self.reparameterizer.kl(dist_a), dim=-1)
 
     def loss_function(self, recon_x, x, params):
         # tf: elbo = -log_likelihood + latent_kl
@@ -304,12 +438,18 @@ class VAE(nn.Module):
 
         # add the mutual information regularizer if
         # running a mixture model ONLY
-        if self.config['reparam_type'] == 'mixture':
+        if self.config['reparam_type'] == 'mixture' \
+           or self.config['reparam_type'] == 'discrete'\
+           and not self.config['disable_regularizers']:
             mut_info = self.reparameterizer.mutual_info(params)
+            # print("torch.norm(kld, p=2)", torch.norm(kld, p=2))
+            # mut_info = torch.clamp(mut_info, min=0, max=torch.norm(kld, p=2).data[0])
+            mut_info = mut_info / torch.norm(mut_info, p=2)
 
+        loss = elbo - self.config['mut_reg'] * mut_info
         return {
-            'loss': elbo - self.config['mut_reg'] * mut_info,
-            'loss_mean': torch.mean(elbo - self.config['mut_reg'] * mut_info),
+            'loss': loss,
+            'loss_mean': torch.mean(loss),
             'elbo_mean': torch.mean(elbo),
             'nll_mean': torch.mean(nll),
             'kld_mean': torch.mean(kld),

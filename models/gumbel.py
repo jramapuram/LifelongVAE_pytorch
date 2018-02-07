@@ -4,10 +4,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributions as D
 from torch.autograd import Variable
 
-from helpers.utils import float_type, one_hot
-from models.layers import View, Identity, UpsampleConvLayer
+from helpers.utils import float_type, one_hot, ones_like
 
 
 class GumbelSoftmax(nn.Module):
@@ -39,7 +39,7 @@ class GumbelSoftmax(nn.Module):
 
     def anneal(self):
         ''' Helper to anneal the categorical distribution'''
-        if self.training is True \
+        if self.training \
            and self.iteration > 0 \
            and self.iteration % 1 == 0: # was originally 10
 
@@ -59,13 +59,27 @@ class GumbelSoftmax(nn.Module):
                                        use_cuda=self.config['cuda'])
         return z, z_hard, log_q_z
 
+    def mutual_info(self, params, eps=1e-9):
+        # prior_sample = generate_random_categorical(qzshp[1], qzshp[0])
+        # cond_ent = tf.reduce_mean(-tf.reduce_sum(tf.log(Q_z_given_x_softmax + eps)* prior_sample, 1))
+        # ent = tf.reduce_mean(-tf.reduce_sum(tf.log(prior_sample + eps) * prior_sample, 1))
+        log_q_z_given_x = params['discrete']['log_q_z'] + eps
+        p_z = self.prior(log_q_z_given_x.size())
+        crossent_loss = -torch.sum(log_q_z_given_x * p_z, dim=1)
+        ent_loss = -torch.sum(torch.log(p_z + eps) * p_z, dim=1)
+        return crossent_loss + ent_loss
+        # return torch.mean(crossent_loss + ent_loss)
+        # return torch.mean(crossent_loss) + torch.mean(ent_loss)
+
     @staticmethod
     def _kld_categorical_uniform(log_q_z, eps=1e-9):
         latent_size = log_q_z.size(-1)
         p_z = 1.0 / latent_size
-        log_p_z = np.log(p_z + eps)
+        log_p_z = np.log(p_z)
         kld_element = log_q_z.exp() * (log_q_z - log_p_z)
-        return torch.sum(kld_element, dim=-1)
+        #return torch.sum(kld_element, dim=-1)
+        return kld_element
+
 
     def kl(self, dist_a):
         return GumbelSoftmax._kld_categorical_uniform(
@@ -102,16 +116,24 @@ class GumbelSoftmax(nn.Module):
 
         return y.view_as(x), None
 
+    def log_likelihood(self, z, params):
+        print("log = ", params['discrete']['logits'].size(), " | z = ", z.size())
+        return D.Categorical(logits=params['discrete']['logits']).log_prob(z)
+
     def forward(self, logits):
         self.anneal()  # anneal first
         z, z_hard, log_q_z = self.reparmeterize(logits)
         params = {
             'z_hard': z_hard,
             'logits': logits,
-            'log_q_z': log_q_z
+            'log_q_z': log_q_z,
+            'tau_scalar': self.tau
         }
         self.iteration += 1
 
-        # return the reparameterization
-        # and the params of gumbel
-        return z, { 'z': z, 'discrete': params }
+        if self.training:
+            # return the reparameterization
+            # and the params of gumbel
+            return z, { 'z': z, 'discrete': params }
+
+        return z_hard, { 'z': z, 'discrete': params }

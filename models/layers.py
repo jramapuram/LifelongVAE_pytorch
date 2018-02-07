@@ -5,6 +5,10 @@ import numpy as np
 from collections import OrderedDict
 from torchvision.models import resnet18
 
+from models.isotropic_gaussian import IsotropicGaussian
+from models.gumbel import GumbelSoftmax
+from models.mixture import Mixture
+
 
 class View(nn.Module):
     def __init__(self, shape):
@@ -21,6 +25,67 @@ class Identity(nn.Module):
 
     def forward(self, x):
         return x
+
+
+class Submodel(nn.Module):
+    def __init__(self, original_model, layer_index):
+        super(Submodel, self).__init__()
+        original_model.compile_full_model()
+
+        # extract the layers
+        self.features = list(original_model.full_model.children())[:layer_index]
+        # DEBUG: use the following
+        # for s in self.features.children():
+        #     print(s)
+
+    def _fix_reparameterizer(self, layer, x):
+        z, _ = layer(x)
+        return z
+
+    def forward(self, x):
+        for layer in self.features:
+            if isinstance(layer, (Mixture, IsotropicGaussian, GumbelSoftmax)):
+                x = self._fix_reparameterizer(layer, x)
+            else:
+                x = layer(x)
+
+        return x
+
+
+class EarlyStopping(object):
+    def __init__(self, max_steps=10):
+        self.max_steps = max_steps
+        self.loss = 0.0
+        self.iteration = 0
+        self.stopping_step = 0
+        self.best_loss = np.inf
+
+    def __call__(self, loss):
+        if (loss < self.best_loss):
+            self.stopping_step = 0
+            self.best_loss = loss
+        else:
+            self.stopping_step += 1
+
+        is_early_stop = False
+        if self.stopping_step >= self.max_steps:
+            print("Early stopping is triggered;  loss:{} | iter: {}".format(loss, self.iteration))
+            is_early_stop = True
+
+        self.iteration += 1
+        return is_early_stop
+
+def flatten_layers(model, base_index=0):
+    layers = []
+    for l in model.children():
+        if isinstance(l, nn.Sequential):
+            sub_layers, base_index = flatten_layers(l, base_index)
+            layers.extend(sub_layers)
+        else:
+            layers.append(('layer_%d'%base_index, l))
+            base_index += 1
+
+    return layers, base_index
 
 
 def init_weights(module):

@@ -9,8 +9,8 @@ def to_data(tensor_or_var):
     '''simply returns the data'''
     if type(tensor_or_var) is Variable:
         return tensor_or_var.data
-    else:
-        return tensor_or_var
+
+    return tensor_or_var
 
 
 class Grapher(object):
@@ -19,6 +19,7 @@ class Grapher(object):
         self.vis = Visdom(server=server,
                           port=port,
                           env=env)
+        self.env = env
         self.param_map = self._init_map()
         self.function_map = {
             'line': self._plot_line,
@@ -31,6 +32,9 @@ class Grapher(object):
         # this is persisted through the lifespan of the object
         # it contains the window objects
         self.registered_lines = {}
+
+    def save(self):
+        self.vis.save([self.env])
 
     def _init_map(self):
         ''' Internal member to return a map of lists '''

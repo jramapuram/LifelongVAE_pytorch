@@ -102,3 +102,6 @@ ENV/
 
 # datasets
 data_dir/
+.models/
+.datasets/
+.idea/

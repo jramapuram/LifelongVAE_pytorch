@@ -1,3 +1,4 @@
+import os
 import math
 import torch
 import torch.nn as nn
@@ -8,6 +9,7 @@ from torchvision.models import resnet18
 from models.isotropic_gaussian import IsotropicGaussian
 from models.gumbel import GumbelSoftmax
 from models.mixture import Mixture
+from helpers.utils import check_or_create_dir
 
 
 class View(nn.Module):
@@ -53,17 +55,25 @@ class Submodel(nn.Module):
 
 
 class EarlyStopping(object):
-    def __init__(self, max_steps=10):
+    def __init__(self, model, max_steps=10, save_best=True):
         self.max_steps = max_steps
+        self.model = model
+        self.save_best = save_best
+
         self.loss = 0.0
         self.iteration = 0
         self.stopping_step = 0
         self.best_loss = np.inf
 
+    def restore(self):
+        self.model.load()
+
     def __call__(self, loss):
         if (loss < self.best_loss):
             self.stopping_step = 0
             self.best_loss = loss
+            if self.save_best:
+                self.model.save(overwrite=True)
         else:
             self.stopping_step += 1
 

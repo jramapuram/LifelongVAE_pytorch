@@ -36,9 +36,10 @@ def log_logistic_256(x, mean, log_s, average=False, dim=None):
 
 
 class VAE(nn.Module):
-    def __init__(self, input_shape, activation_fn=nn.ELU, **kwargs):
+    def __init__(self, input_shape, activation_fn=nn.ELU, num_current_model=0, **kwargs):
         super(VAE, self).__init__()
         self.input_shape = input_shape
+        self.num_current_model = num_current_model
         self.activation_fn = activation_fn
         self.is_color = input_shape[0] > 1
         self.chans = 3 if self.is_color else 1
@@ -339,22 +340,11 @@ class VAE(nn.Module):
             x.view(batch_size, -1)
         )
         return -torch.sum(nll, dim=-1)
-        # assert x.size() == recon_x_logits.size()
-        # batch_size = recon_x_logits.size(0)
-        # recon_x_logits = recon_x_logits.view(batch_size, -1)
-        # x = x.view(batch_size, -1)
-        # max_val = (-recon_x_logits).clamp(min=0)
-        # nll = recon_x_logits - recon_x_logits * x \
-        #       + max_val + ((-max_val).exp() + (-recon_x_logits - max_val).exp()).log()
-        # return torch.sum(nll, dim=-1)
 
     def nll_clamp(self, x, recon):
         batch_size, num_half_chans = x.size(0), recon.size(1) // 2
         recon_mu = recon[:, 0:num_half_chans, :, :]
         recon_logvar = recon[:, num_half_chans:, :, :]
-
-        # if recon_sigma is None:
-        #     recon_sigma = ones_like(recon_mu, self.config['cuda'])
 
         return log_logistic_256(x.view(batch_size, -1),
                                 torch.clamp(recon_mu.view(batch_size, -1), min=0.+1./512., max=1.-1./512.),
@@ -380,10 +370,7 @@ class VAE(nn.Module):
         recon_mu = recon[:, 0:num_half_chans, :, :]
         recon_logvar = recon[:, num_half_chans:, :, :]
 
-        # if recon_logvar is None:
-        #     recon_logvar = ones_like(recon_mu, self.config['cuda'])
-
-        # XXX: currently broken
+        # XXX: currently broken, so set var to 1
         recon_logvar = ones_like(recon_mu, self.config['cuda'])
 
         nll = D.Normal(
@@ -392,34 +379,6 @@ class VAE(nn.Module):
             recon_logvar.view(batch_size, -1)
         ).log_prob(x.view(batch_size, -1))
         return -torch.sum(nll, dim=-1)
-
-
-    # def nll_gaussian(self, recon_x_logits, x, logvar=1):
-    #     # Helpers to get the gaussian log-likelihood pulled from tensorflow
-    #     # (https://github.com/tensorflow/tensorflow/blob/r1.2/tensorflow/python/ops/distributions/normal.py)
-    #     def _z(x, loc, scale, eps=1e-9):
-    #         """Standardize input `x` to a unit normal."""
-    #         return (x - loc) / (scale + eps)
-
-    #     # return -0.5 * ( log_var + K.square( sample - mean ) / K.exp( log_var ) )
-    #     def _log_unnormalized_prob(x, loc, scale):
-    #         return -0.5 * torch.pow(_z(x, loc, scale), 2)
-
-    #     def _log_normalization(scale, eps=1e-9):
-    #         if isinstance(scale, (float, int, np.float32, np.float64)):
-    #             return np.log(scale + eps) + 0.5 * np.log(2. * np.pi)
-
-    #         return torch.log(scale + eps) + 0.5 * np.log(2. * np.pi)
-
-    #     batch_size = x.size(0)
-    #     xflat = x.view(batch_size, -1)
-    #     locflat = F.sigmoid(recon_x_logits.view(batch_size, -1))
-    #     scaleflat = logvar if isinstance(logvar, (float, int, np.float32, np.float64)) \
-    #                 else logvar.view(batch_size, -1)
-    #     normalized_prob = _log_normalization(scale=scaleflat)
-    #     unnormalized_prob = _log_unnormalized_prob(xflat, loc=locflat, scale=scaleflat)
-    #     nll = unnormalized_prob - normalized_prob
-    #     return torch.sum(nll, dim=-1)
 
     def kld(self, dist_a):
         ''' accepts param maps for dist_a and dist_b,

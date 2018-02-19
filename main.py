@@ -18,7 +18,7 @@ from helpers.grapher import Grapher
 from helpers.utils import to_data, softmax_accuracy, expand_dims, \
     int_type, float_type, long_type, add_weight_norm, ones_like, \
     squeeze_expand_dim, frechet_gauss_gauss, frechet_gauss_gauss_np, \
-    append_to_csv, num_samples_in_loader
+    append_to_csv, num_samples_in_loader, zero_pad_smaller_cat
 
 parser = argparse.ArgumentParser(description='LifeLong VAE Pytorch')
 
@@ -39,7 +39,9 @@ parser.add_argument('--download', type=int, default=1,
 parser.add_argument('--data-dir', type=str, default='./.datasets', metavar='DD',
                     help='directory which contains input data')
 parser.add_argument('--calculate-fid', action='store_true',
-                    help='calculate FID score (default: True)')
+                    help='calculate FID score (default: False)')
+parser.add_argument('--early-stop', action='store_true',
+                    help='enable early stopping (default: False)')
 
 # Model parameters
 parser.add_argument('--batch-size', type=int, default=64, metavar='N',
@@ -66,6 +68,8 @@ parser.add_argument('--disable-regularizers', action='store_true',
                     help='disables mutual info and consistency regularizers')
 parser.add_argument('--disable-sequential', action='store_true',
                     help='enables standard batch training')
+parser.add_argument('--disable-student-teacher', action='store_true',
+                    help='uses a standard VAE without Student-Teacher architecture')
 
 # Optimizer
 parser.add_argument('--optimizer', type=str, default="adamnorm",
@@ -141,7 +145,13 @@ def train(epoch, model, fisher, optimizer, data_loader, grapher):
                 100. * batch_idx * len(data) / num_samples,
                 loss['loss_mean'].data[0], loss['kld_mean'].data[0], loss['nll_mean'].data[0]))
 
-            register_plots(loss, grapher, epoch=TOTAL_ITER)
+            # gether tau val for discrete annealing if it exists
+            tau_val = output_map['student']['params']['discrete']['tau_scalar'] \
+                      if args.reparam_type == 'discrete' \
+                         or args.reparam_type == 'mixture' else None
+
+            # plot images and lines
+            register_plots(loss, grapher, epoch=TOTAL_ITER, tau=tau_val)
             register_images(output_map['student']['x_reconstr'],
                             output_map['augmented']['data'],
                             grapher)
@@ -151,7 +161,7 @@ def train(epoch, model, fisher, optimizer, data_loader, grapher):
         TOTAL_ITER += 1
 
 
-def register_plots(loss, grapher, epoch, prefix='train'):
+def register_plots(loss, grapher, epoch, tau=None, prefix='train'):
     grapher.register_single({'%s_loss' % prefix: [[epoch], [loss['loss_mean'].data[0]]]},
                             plot_type='line')
     grapher.register_single({'%s_kld' % prefix: [[epoch], [loss['kld_mean'].data[0]]]},
@@ -164,15 +174,18 @@ def register_plots(loss, grapher, epoch, prefix='train'):
                             plot_type='line')
     grapher.register_single({'%s_elbo' % prefix: [[epoch], [loss['elbo_mean'].data[0]]]},
                             plot_type='line')
-    if 'discrete' in loss:
-        grapher.register_single(
-            {'%s_temperature' % prefix: [[epoch], [loss['discrete']['temperature'].data[0]]]},
-            plot_type='line')
+
+    if 'ewc_mean' in loss:
+        grapher.register_single({'%s_ewc' % prefix: [[epoch], [loss['ewc_mean'].data[0]]]},
+                                plot_type='line')
 
     if 'posterior_regularizer_mean' in loss:
         grapher.register_single(
             {'%s_posterior_reg' % prefix: [[epoch], [loss['posterior_regularizer_mean'].data[0]]]},
             plot_type='line')
+
+    if tau:
+        grapher.register_single({'%s_tau' % prefix: [[epoch], [tau]]},plot_type='line')
 
 
 def register_images(reconstr_x, data, grapher, prefix="train"):
@@ -225,14 +238,23 @@ def test(epoch, model, data_loader, grapher):
         loss_map['kld_mean'].data[0],
         loss_map['nll_mean'].data[0]))
 
+    # gather the tau value for the annealing schedule
+    tau_val = output_map['student']['params']['discrete']['tau_scalar'] \
+              if args.reparam_type == 'discrete' \
+                 or args.reparam_type == 'mixture' else None
 
     # plot the test accuracy and loss
-    register_plots(loss_map, grapher, epoch=epoch, prefix='test')
+    register_plots(loss_map, grapher, epoch=epoch, tau=tau_val, prefix='test')
     register_images(output_map['student']['x_reconstr'],
                     output_map['augmented']['data'],
                     grapher, 'test')
     grapher.show()
-    return loss_map['elbo_mean'].detach().data[0] # return this for early stopping
+
+    # return this for early stopping
+    loss_val = loss_map['elbo_mean'].detach().data[0]
+    loss_map.clear()
+    output_map.clear()
+    return loss_val
 
 
 def calculate_fid_between_models(fid_model, model, data_loader,
@@ -285,20 +307,9 @@ def calculate_fid_from_generated_images(fid_model, model, data_loader, fid_layer
 
     with torch.no_grad():
         synthetic = [model.generate_synthetic_samples(model.student, args.batch_size)
-                                 for _ in range(num_synthetic + 1)]
-        #synthetic = torch.cat(synthetic, 0)[0:num_test_samples]
-        #print("synthetic_samples = ", synthetic.size())
-
-        # keep track of the features for later use
-        # synthetic_features, test_features = [], []
-
+                     for _ in range(num_synthetic + 1)]
         for (data, _), generated in zip(data_loader.test_loader, synthetic):
             data = Variable(data).cuda() if args.cuda else Variable(data)
-            # batch_size = data.size(0)
-            # extract features from both the models
-            # fid += frechet_gauss_gauss_np(fid_submodel(generated).view(batch_size, -1).cpu().numpy(),
-            #                               fid_submodel(data).view(batch_size, -1).cpu().numpy()
-            # )
             fid += frechet_gauss_gauss(
                 D.Normal(torch.mean(fid_submodel(generated), dim=0), torch.var(fid_submodel(generated), dim=0)),
                 D.Normal(torch.mean(fid_submodel(data), dim=0), torch.var(fid_submodel(data), dim=0))
@@ -310,18 +321,6 @@ def calculate_fid_from_generated_images(fid_model, model, data_loader, fid_layer
         (num_test_samples // args.batch_size) * args.batch_size, frechet_dist)
     )
     return frechet_dist
-
-    #         synthetic_features.append(fid_submodel(generated).view(batch_size, -1))
-    #         test_features.append(fid_submodel(data).view(batch_size, -1))
-
-    # # concat and pull to CPU
-    # synthetic_features = torch.cat(synthetic_features, 0).cpu().numpy()
-    # test_features = torch.cat(test_features, 0).cpu().numpy()
-
-    # # calculate the CPU frechet score
-    # frechet_dist = frechet_gauss_gauss_np(synthetic_features, test_features)
-    # print("frechet distance: ", frechet_dist)
-    # return frechet_dist
 
 
 def generate(student_teacher, grapher, name='teacher'):
@@ -339,17 +338,17 @@ def generate(student_teacher, grapher, name='teacher'):
         grapher.register_single({'generated_%s'%name: gen}, plot_type='imgs')
 
         # sequential generation for discrete and mixture reparameterizations
-        # if args.reparam_type == 'mixture' or args.reparam_type == 'discrete':
-        #     gen = student_teacher.generate_synthetic_sequential_samples(model[name]).detach()
-        #     gen = torch.min(gen, ones_like(gen, args.cuda))
-        #     grapher.register_single({'sequential_generated_%s'%name: gen}, plot_type='imgs')
+        if args.reparam_type == 'mixture' or args.reparam_type == 'discrete':
+            gen = student_teacher.generate_synthetic_sequential_samples(model[name]).detach()
+            gen = torch.min(gen, ones_like(gen, args.cuda))
+            grapher.register_single({'sequential_generated_%s'%name: gen}, plot_type='imgs')
 
 
 def get_model_and_loader():
     ''' helper to return the model and the loader '''
     if args.disable_sequential: # vanilla batch training
         loaders = get_loader(args)
-        loaders = list(loaders) if not isinstance(loaders, list) else loaders
+        loaders = [loaders] if not isinstance(loaders, list) else loaders
     else: # classes split
         loaders = get_sequential_data_loaders(args, num_classes=10)
 
@@ -371,22 +370,15 @@ def get_model_and_loader():
 
 
 def estimate_fisher(model, data_loader, sample_size=1024):
-    # modified from github user kuc2477
+    # modified from github user kuc2477's code
     # sample loglikelihoods from the dataset.
     loglikelihoods = []
     for x, _ in data_loader.train_loader:
         x = Variable(x).cuda() if args.cuda else Variable(x)
-        # encoded = model.teacher.encode(x)
-        # reparam = model.teacher.reparameterizer
-        # _, params = reparam(encoded)
-
-        # loglikelihoods.append(
-        #     reparam.log_likelihood(params['z'], params)[range(args.batch_size)]
-        # )
-        reconstr_x, _ = model.teacher(x)
-
+        reconstr_x, params = model.teacher(x)
+        loss_teacher = model.teacher.loss_function(reconstr_x, x, params)
         loglikelihoods.append(
-            model.teacher.nll(reconstr_x, x)
+            loss_teacher['loss']
         )
         if len(loglikelihoods) >= sample_size // args.batch_size:
             break
@@ -408,6 +400,62 @@ def lazy_generate_modules(model, img_shp):
     data = float_type(args.cuda)(args.batch_size, *img_shp).normal_()
     model(Variable(data))
 
+def calculate_consistency(model, loader):
+    ''' \sum z_d(teacher) == z_d(student) forall test samples '''
+    consistency = 0.0
+
+    if model.current_model > 0 and (args.reparam_type == 'mixture'
+                                    or args.reparam_type == 'discrete'):
+        model.eval() # prevents data augmentation
+        consistency = []
+
+        for img, _ in loader.test_loader:
+            with torch.no_grad():
+                img = Variable(img).cuda() if args.cuda else Variable(img)
+
+                output_map = model(img)
+                teacher_posterior = output_map['teacher']['params']['discrete']['logits']
+                student_posterior = output_map['student']['params']['discrete']['logits']
+                teacher_posterior = F.softmax(teacher_posterior, dim=-1)
+                student_posterior = F.softmax(student_posterior, dim=-1)
+                teacher_posterior, student_posterior \
+                    = zero_pad_smaller_cat(teacher_posterior, student_posterior,
+                                           cuda=args.cuda)
+
+                correct = to_data(teacher_posterior).max(1)[1] \
+                          == to_data(student_posterior).max(1)[1]
+                consistency.append(torch.mean(correct.type(float_type(args.cuda))))
+                # print("teacher = ", teacher_posterior)
+                # print("student = ", student_posterior)
+                # print("consistency[-1]=", correct)
+
+        num_test_samples = num_samples_in_loader(loader.test_loader)
+        consistency = np.mean(consistency)
+        print("Consistency [#samples: {}]: {}\n".format(num_test_samples,
+                                                      consistency))
+    return np.asarray([consistency])
+
+
+def calculate_fid(fid_model, model, loader, grapher, across_models=False):
+    # evaluate and cache away the FID score
+    fid = np.inf
+    if args.calculate_fid:
+        if across_models:
+            # weird way
+            fid = calculate_fid_between_models(fid_model, model, loader)
+        else:
+            # standard way
+            fid = calculate_fid_from_generated_images(fid_model, model, loader)
+
+        grapher.vis.text(str(fid), opts=dict(title="FID"))
+
+    return fid
+
+def test_and_generate(epoch, model, loader, grapher):
+    test_loss = test(epoch, model, loader, grapher)
+    generate(model, grapher, 'student') # generate student samples
+    generate(model, grapher, 'teacher') # generate teacher samples
+    return test_loss
 
 def run(args):
     # collect our model and data loader
@@ -429,40 +477,46 @@ def run(args):
 
     # main training loop
     for j, loader in enumerate(data_loaders):
-        num_epochs = args.epochs + np.random.randint(0, 13)
+        num_epochs = args.epochs #+ np.random.randint(0, 13)
         print("training current distribution for {} epochs".format(num_epochs))
-        early = EarlyStopping()
+        early = EarlyStopping(model, max_steps=50) if args.early_stop else None
 
+        test_loss = 0.
         for epoch in range(1, num_epochs + 1):
             train(epoch, model, fisher, optimizer, loader, grapher)
-            elbo = test(epoch, model, loader, grapher)
+            test_loss = test(epoch, model, loader, grapher)
+            if args.early_stop and early(test_loss):
+                early.restore() # restore and test+generate again
+                test_loss = test_and_generate(epoch, model, loader, grapher)
+                break
+
             generate(model, grapher, 'student') # generate student samples
             generate(model, grapher, 'teacher') # generate teacher samples
-            # if early(elbo):
-            #     break
 
-        # evaluate and cache away the FID score
+        # evaluate one-time metrics
+        append_to_csv([test_loss], "{}_test_elbo.csv".format(args.uid))
+        append_to_csv(calculate_consistency(model, loader),
+                      "{}_consistency.csv".format(args.uid))
         if args.calculate_fid:
-            fid = calculate_fid_from_generated_images(fid_model, model, loader)
-            grapher.vis.text(str(fid), opts=dict(title="FID"))
-            if args.uid:
-                filename = filename="{}.csv".format(args.uid)
-                append_to_csv(np.asarray(fid), filename)
+            append_to_csv(calculate_fid(fid_model, model, loader, grapher),
+                          "{}_fid.csv".format(args.uid))
 
         if j != len(data_loaders) - 1:
-            # spawn a new student & rebuild grapher
-            # we also pass the new model's parameters through
-            # a new optimizer
-            model.fork()
-            lazy_generate_modules(model, data_loaders[0].img_shp)
-            optimizer = build_optimizer(model.student)
-            grapher.save()
+            # spawn a new student & rebuild grapher; we also pass
+            # the new model's parameters through a new optimizer.
+            if not args.disable_student_teacher:
+                model.fork()
+                lazy_generate_modules(model, data_loaders[0].img_shp)
+                optimizer = build_optimizer(model.student)
+
+            grapher.save() # save to json after distributional interval
             grapher = Grapher(env=model.get_name(),
                               server=args.visdom_url,
                               port=args.visdom_port)
 
-            # calculate the fisher from the previous data loader
-            fisher = estimate_fisher(model, loader) if args.ewc else None
+            if args.ewc:
+                # calculate the fisher from the previous data loader
+                fisher = estimate_fisher(model, loader) if args.ewc else None
 
 
 if __name__ == "__main__":

@@ -77,7 +77,6 @@ class GumbelSoftmax(nn.Module):
         p_z = 1.0 / latent_size
         log_p_z = np.log(p_z)
         kld_element = log_q_z.exp() * (log_q_z - log_p_z)
-        #return torch.sum(kld_element, dim=-1)
         return kld_element
 
 

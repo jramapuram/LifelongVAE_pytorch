@@ -26,6 +26,14 @@ def bce_accuracy(pred_logits, targets, cuda=False, size_average=True):
     return reduction_fn(pred.data.eq(to_data(targets)).cpu().type(torch.FloatTensor), -1)
 
 
+def recurse_print_keys(m):
+    for k, v in m.items():
+        if isinstance(v, dict):
+            return recurse_print_keys(v)
+
+        print(k)
+
+
 def expand_dims(tensor, dim=0):
     shape = list(tensor.size())
     shape.insert(dim, 1)
@@ -246,6 +254,26 @@ def one_hot(num_cols, indices, use_cuda=False):
         mask = Variable(mask, volatile=indices.volatile)
 
     return mask.scatter_(1, indices, ones)
+
+
+def zero_pad_smaller_cat(cat1, cat2, cuda=False):
+    c1shp = cat1.size()
+    c2shp = cat2.size()
+    diff = abs(c1shp[1] - c2shp[1])
+
+    # blend in extra zeros appropriately
+    if c1shp[1] > c2shp[1]:
+        cat2 = torch.cat(
+            [cat2,
+             Variable(float_type(cuda)(c2shp[0], diff).zero_())],
+            dim=-1)
+    elif c2shp[1] > c1shp[1]:
+        cat1 = torch.cat(
+            [cat1,
+             Variable(float_type(cuda)(c1shp[0], diff).zero_())],
+            dim=-1)
+
+    return [cat1, cat2]
 
 
 def to_data(tensor_or_var):

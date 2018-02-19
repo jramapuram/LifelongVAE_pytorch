@@ -8,8 +8,10 @@ import torch.optim as optim
 from torch.autograd import Variable
 from collections import OrderedDict
 
+from optimizers.adamnormgrad import AdamNormGrad
 from models.layers import View, Identity, flatten_layers, EarlyStopping
 from datasets.loader import get_loader
+from datasets.utils import GenericLoader, simple_merger
 from helpers.utils import float_type, zeros_like, ones_like, \
     softmax_accuracy, check_or_create_dir
 
@@ -18,6 +20,7 @@ def build_optimizer(model, args):
     optim_map = {
         "rmsprop": optim.RMSprop,
         "adam": optim.Adam,
+        "adamnorm": AdamNormGrad,
         "adadelta": optim.Adadelta,
         "sgd": optim.SGD,
         "lbfgs": optim.LBFGS
@@ -107,25 +110,30 @@ def train_fid_model(reparameterizer_input_size,
                     args):
     ''' builds and trains a classifier '''
     loader = get_loader(args)
+    if isinstance(loader, list): # has a sequential loader
+        # loader = simple_merger(loader, args.batch_size, args.cuda)
+        loader = loader[0]
+
     model = FID(loader.img_shp,
                 loader.output_size,
-                reparameterizer_input_size,
-                reparameterizer_output_size,
+                reparameterizer_input_size=32,
+                reparameterizer_output_size=32,
                 kwargs=vars(args))
     if not model.model_exists:
         lazy_generate_modules(model, loader.img_shp,
                               args.batch_size, args.cuda)
         optimizer = build_optimizer(model, args)
-        early_stop = EarlyStopping(max_steps=10)
+        early_stop = EarlyStopping(model, max_steps=10)
 
         for epoch in range(1, args.epochs + 1):
             train(epoch, model, optimizer, loader, args)
             loss, _ = test(epoch, model, loader, args)
             if early_stop(loss):
+                early_stop.restore()
                 break
 
         # save the model
-        model.save_model()
+        model.save()
 
     return model
 
@@ -153,9 +161,9 @@ class FID(nn.Module):
         self.encoder = self.build_encoder()
         self.decoder = self.build_decoder()
         self.full_model = None
-        self.model_exists = self.load_model()
+        self.model_exists = self.load()
 
-    def load_model(self):
+    def load(self):
         # load the FID model if it exists
         if os.path.isdir(".models"):
             model_filename = os.path.join(".models", self.get_name() + ".th")
@@ -169,14 +177,13 @@ class FID(nn.Module):
 
         return False
 
-    def save_model(self):
+    def save(self, overwrite=False):
         # save the FID model if it doesnt exist
         check_or_create_dir(".models")
         model_filename = os.path.join(".models", self.get_name() + ".th")
-        if not os.path.isfile(model_filename):
+        if not os.path.isfile(model_filename) or overwrite:
             print("saving existing FID model")
             torch.save(self.state_dict(), model_filename)
-
 
     def get_name(self):
         full_hash_str = "_" + str(self.config['layer_type']) + \
@@ -196,8 +203,9 @@ class FID(nn.Module):
                                                      .replace('(', '') \
                                                      .replace(')', '') \
                                                      .replace('\'', '')
-        tasks_cleaned = [t.split('_')[1] if 'rotated' in t else t for t in self.config['task']]
-        return 'fid_' + '_'.join(tasks_cleaned) + full_hash_str
+        # tasks_cleaned = [t.split('_')[1] if 'rotated' in t else t for t in self.config['task']]
+        # return 'fid_' + '_'.join(tasks_cleaned) + full_hash_str
+        return 'fid_' + '_'.join(self.config['task']) + full_hash_str
 
 
     def build_encoder(self):

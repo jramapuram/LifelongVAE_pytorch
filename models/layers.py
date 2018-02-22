@@ -100,27 +100,12 @@ def flatten_layers(model, base_index=0):
 
 def init_weights(module):
     for m in module.modules():
-        if isinstance(m, nn.Conv2d):
-            # print("initializing ", m)
-            n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
-            m.weight.data.normal_(0, math.sqrt(2. / n))
-            #m.bias.data.zero_()
-        elif isinstance(m, nn.BatchNorm2d):
-            # print("initializing ", m)
-            m.weight.data.fill_(1)
-            m.bias.data.zero_()
-        elif isinstance(m, nn.Linear):
-            # print("initializing ", m)
-            # nn.init.kaiming_normal(m.weight)
+        if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
+            print("initializing ", m, " with xavier init")
             nn.init.xavier_uniform(m.weight)
-            m.bias.data.zero_()
-        elif isinstance(m, nn.RNNBase):
-            for param_name, param in m.named_parameters():
-                if 'weight' in param_name or \
-                   'W_' in param_name or \
-                   'U_' in param_name:
-                    print("initializing ", param_name)
-                    nn.init.xavier_normal(param)
+            if hasattr(m, 'bias') and m.bias is not None:
+                print("initial bias from ", m, " with zeros")
+                nn.init.constant(m.bias, 0.0)
         elif isinstance(m, nn.Sequential):
             for mod in m:
                 init_weights(mod)
@@ -192,7 +177,7 @@ class Convolutional(nn.Module):
         # Build our model as a sequential layer
         self.net = self._build_layers()
         self.add_module('network', self.net)
-        self = init_weights(self)
+        #self = init_weights(self)
 
     def forward(self, x):
         if isinstance(x.data, torch.cuda.FloatTensor) and self.ngpu > 1:
@@ -305,7 +290,7 @@ class Dense(nn.Module):
         # Build our model as a sequential layer
         self.net = self._build_layers()
         self.add_module('network', self.net)
-        self = init_weights(self)
+        #self = init_weights(self)
 
     def forward(self, x):
         if isinstance(x.data, torch.cuda.FloatTensor) and self.ngpu > 1:

@@ -11,7 +11,7 @@ from torch.autograd import Variable
 from models.vae import VAE
 from models.fid import train_fid_model
 from models.student_teacher import StudentTeacher
-from models.layers import Submodel, EarlyStopping
+from models.layers import Submodel, EarlyStopping, init_weights
 from datasets.loader import get_sequential_data_loaders, get_loader
 from optimizers.adamnormgrad import AdamNormGrad
 from helpers.grapher import Grapher
@@ -360,6 +360,7 @@ def get_model_and_loader():
     # build the combiner which takes in the VAE as a parameter
     # and projects the latent representation to the output space
     student_teacher = StudentTeacher(vae, kwargs=vars(args))
+    #student_teacher = init_weights(student_teacher)
 
     # build the grapher object
     grapher = Grapher(env=student_teacher.get_name(),

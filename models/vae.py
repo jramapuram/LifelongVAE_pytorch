@@ -147,10 +147,7 @@ class VAE(nn.Module):
                 self.activation_fn(),
                 nn.Linear(512, 512),
                 nn.BatchNorm1d(512),
-                self.activation_fn(),
-                nn.Linear(512, self.reparameterizer.input_size)
-                # nn.BatchNorm1d(self.reparameterizer.input_size),
-                # self.activation_fn(),
+                self.activation_fn()
             )
         else:
             raise Exception("unknown layer type requested")
@@ -226,8 +223,6 @@ class VAE(nn.Module):
             # build a simple linear projector
             setattr(self, name, nn.Sequential(
                 View([-1, input_size]),
-                # nn.BatchNorm1d(input_size),
-                # self.activation_fn(),
                 nn.Linear(input_size, output_size)
             ))
 
@@ -401,11 +396,13 @@ class VAE(nn.Module):
            or self.config['reparam_type'] == 'discrete'\
            and not self.config['disable_regularizers']:
             mut_info = self.reparameterizer.mutual_info(params)
-            # print("torch.norm(kld, p=2)", torch.norm(kld, p=2))
-            # mut_info = torch.clamp(mut_info, min=0, max=torch.norm(kld, p=2).data[0])
-            mut_info = mut_info / torch.norm(mut_info, p=2)
 
-        loss = elbo - self.config['mut_reg'] * mut_info
+            # Clamping strategies: 2 and 3 are about the same [empirically in ELBO]
+            # mut_info = self.config['mut_reg'] * torch.clamp(mut_info, min=0, max=torch.norm(kld, p=2).data[0])
+            # mut_info = self.config['mut_reg'] * mut_info
+            mut_info = self.config['mut_reg'] * (mut_info / torch.norm(mut_info, p=2))
+
+        loss = elbo + mut_info
         return {
             'loss': loss,
             'loss_mean': torch.mean(loss),

@@ -47,32 +47,6 @@ def kl_categorical_categorical(dist_a, dist_b, rnd_perm, from_index=0, cuda=Fals
     return torch.sum(dist_a_softmax * delta_log_probs1, dim=-1)
 
 
-# def kl_categorical_categorical(dist_a, dist_b, rnd_perm, from_index=0, cuda=False):
-#     dist_a_softmax = F.softmax(dist_a['logits'][from_index:], dim=-1)
-#     dist_b_softmax = F.softmax(dist_b['logits'][from_index:], dim=-1)
-#     dist_a_softmax, dist_b_softmax \
-#         = zero_pad_smaller_cat(dist_a_softmax,
-#                                dist_b_softmax,
-#                                cuda=cuda)
-#     return torch.sum(dist_a_softmax * torch.log(dist_a_softmax / (dist_b_softmax + 1e-9)), dim=-1)
-
-
-# def kl_isotropic_gauss_gauss(dist_a, dist_b, rnd_perm=None, eps=1e-9):
-#     # invert the shuffle for the KL calculation
-#     # dist_a_mu = invert_shuffle(dist_a['mu'], rnd_perm) # undo the random perm
-#     # dist_b_mu = invert_shuffle(dist_b['mu'], rnd_perm) # undo the random perm
-#     # dist_a_logvar = invert_shuffle(dist_a['logvar'], rnd_perm) # undo the random perm
-#     # dist_b_logvar = invert_shuffle(dist_b['logvar'], rnd_perm) # undo the random perm
-#     dist_a_mu, dist_b_mu = dist_a['mu'], dist_b['mu']
-#     dist_a_logvar, dist_b_logvar = dist_a['logvar'], dist_b['logvar']
-
-#     # https://github.com/tensorflow/tensorflow/blob/r1.1/tensorflow/contrib/distributions/python/ops/normal.py
-#     sigma_a_sq = dist_a_logvar.pow(2)
-#     sigma_b_sq = dist_b_logvar.pow(2) + eps
-#     ratio = sigma_a_sq / sigma_b_sq
-#     return torch.sum(torch.pow(dist_a_mu - dist_b_mu, 2) / (2 * sigma_b_sq)
-#                      + 0.5 * (ratio - 1 - torch.log(ratio + eps)), dim=-1)
-
 def kl_isotropic_gauss_gauss(dist_a, dist_b, rnd_perm=None):
     n0 = D.Normal(dist_a['mu'], dist_a['logvar'])
     n1 = D.Normal(dist_b['mu'], dist_b['logvar'])

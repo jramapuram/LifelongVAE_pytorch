@@ -31,24 +31,20 @@ class GumbelSoftmax(nn.Module):
     def _setup_anneal_params(self):
         # setup the base gumbel rates
         # TODO: parameterize this
-        self.tau = 1.0
-        self.tau0 = 1.0
-        self.anneal_rate = 0.0003
-        # self.anneal_rate = 0.0003 #1e-5
+        self.tau, self.tau0 = 1.0, 1.0
+        self.anneal_rate = 3e-5
         self.min_temp = 0.5
 
-    def anneal(self):
+    def anneal(self, anneal_interval=10):
         ''' Helper to anneal the categorical distribution'''
         if self.training \
            and self.iteration > 0 \
-           and self.iteration % 1 == 0: # was originally 10
+           and self.iteration % anneal_interval == 0:
 
             # smoother annealing
             rate = -self.anneal_rate * self.iteration
             self.tau = np.maximum(self.tau0 * np.exp(rate),
                                   self.min_temp)
-            # print("tau = ", self.tau)
-
             # hard annealing
             # self.tau = np.maximum(0.9 * self.tau, self.min_temp)
 
@@ -60,10 +56,12 @@ class GumbelSoftmax(nn.Module):
         return z, z_hard, log_q_z
 
     def mutual_info(self, params, eps=1e-9):
+        # tensorflow implementation:
         # prior_sample = generate_random_categorical(qzshp[1], qzshp[0])
         # cond_ent = tf.reduce_mean(-tf.reduce_sum(tf.log(Q_z_given_x_softmax + eps)* prior_sample, 1))
         # ent = tf.reduce_mean(-tf.reduce_sum(tf.log(prior_sample + eps) * prior_sample, 1))
-        log_q_z_given_x = params['discrete']['log_q_z'] + eps
+
+        log_q_z_given_x = params['discrete']['log_q_z']
         p_z = self.prior(log_q_z_given_x.size())
         crossent_loss = -torch.sum(log_q_z_given_x * p_z, dim=1)
         ent_loss = -torch.sum(torch.log(p_z + eps) * p_z, dim=1)

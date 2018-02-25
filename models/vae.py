@@ -1,10 +1,11 @@
 from __future__ import print_function
 import pprint
 import numpy as np
+import pyro
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributions as D
+import pyro.distributions as D
 from torch.autograd import Variable
 from collections import OrderedDict
 
@@ -49,25 +50,46 @@ class VAE(nn.Module):
         pp = pprint.PrettyPrinter(indent=4)
         pp.pprint(self.config)
 
-        # build the reparameterizer
-        if self.config['reparam_type'] == "isotropic_gaussian":
-            print("using isotropic gaussian reparameterizer")
-            self.reparameterizer = IsotropicGaussian(self.config)
-        elif self.config['reparam_type'] == "discrete":
-            print("using gumbel softmax reparameterizer")
-            self.reparameterizer = GumbelSoftmax(self.config)
-        elif self.config['reparam_type'] == "mixture":
-            print("using mixture reparameterizer")
-            self.reparameterizer = Mixture(num_discrete=self.config['discrete_size'],
-                                           num_continuous=self.config['continuous_size'],
-                                           config=self.config)
-        else:
-            raise Exception("unknown reparameterization type")
+        # build the reparameterizer(s)
+        self.reparameterizer = self._build_reparameterizers(
+            self.config['reparam_type']
+        )
 
         # build the encoder and decoder
         self.encoder = self.build_encoder()
         self.decoder = self.build_decoder()
         self.full_model = None
+
+    def _build_reparameterizers(self, reparam_list):
+        ''' a simple helper to add all the reparameterizers
+            if we have more than one
+        '''
+        if not isinstance(reparam_list):
+            reparam_list = list(reparam_list)
+
+        all_reparameterizers = []
+        for li in reparam_list:
+            if li == "isotropic_gaussian":
+                print("adding isotropic gaussian reparameterizer")
+                all_reparameterizers.append(IsotropicGaussian(self.config))
+            elif li == "discrete":
+                print("adding gumbel softmax reparameterizer")
+                all_reparameterizers.append(GumbelSoftmax(self.config))
+            elif li == "mixture":
+                print("adding mixture reparameterizer")
+                all_reparameterizers.append(Mixture(num_discrete=self.config['discrete_size'],
+                                                    num_continuous=self.config['continuous_size'],
+                                                    config=self.config))
+            else:
+                raise Exception("unknown reparameterization type")
+
+        if len(all_reparameterizers) == 1 :
+            # if we have just one return it
+            return all_reparameterizers[-1]
+
+        # TODO: else we wrap it in a container
+        return SequentialReparameterizer(all_reparameterizers)
+
 
     def get_name(self):
         if self.config['reparam_type'] == "mixture":
@@ -263,6 +285,7 @@ class VAE(nn.Module):
         self._lazy_init_dense(conv_output_shp,
                               self.reparameterizer.input_size,
                               name='enc_proj')
+        pyro.module("encoder", nn.Sequential(self.encoder, self.enc_proj))
         return self.enc_proj(conv)
 
     def _project_decoder_for_variance(self, logits):
@@ -396,11 +419,11 @@ class VAE(nn.Module):
            or self.config['reparam_type'] == 'discrete'\
            and not self.config['disable_regularizers']:
             mut_info = self.reparameterizer.mutual_info(params)
+            # print("torch.norm(kld, p=2)", torch.norm(kld, p=2))
+            # mut_info = torch.clamp(mut_info, min=0, max=torch.norm(kld, p=2).data[0])
 
-            # Clamping strategies: 2 and 3 are about the same [empirically in ELBO]
-            # mut_info = self.config['mut_reg'] * torch.clamp(mut_info, min=0, max=torch.norm(kld, p=2).data[0])
-            # mut_info = self.config['mut_reg'] * mut_info
-            mut_info = self.config['mut_reg'] * (mut_info / torch.norm(mut_info, p=2))
+            #mut_info = mut_info / torch.norm(mut_info, p=2)
+            mut_info = self.config['mut_reg'] * mut_info
 
         loss = elbo + mut_info
         return {

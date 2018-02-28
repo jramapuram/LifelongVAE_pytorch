@@ -61,7 +61,7 @@ class GumbelSoftmax(nn.Module):
         # cond_ent = tf.reduce_mean(-tf.reduce_sum(tf.log(Q_z_given_x_softmax + eps)* prior_sample, 1))
         # ent = tf.reduce_mean(-tf.reduce_sum(tf.log(prior_sample + eps) * prior_sample, 1))
 
-        log_q_z_given_x = params['discrete']['log_q_z']
+        log_q_z_given_x = params['discrete']['log_q_z'] + eps
         p_z = self.prior(log_q_z_given_x.size())
         crossent_loss = -torch.sum(log_q_z_given_x * p_z, dim=1)
         ent_loss = -torch.sum(torch.log(p_z + eps) * p_z, dim=1)

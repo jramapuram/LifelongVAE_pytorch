@@ -19,13 +19,13 @@ class GumbelSoftmax(nn.Module):
         self.input_size = self.config['discrete_size']
         self.output_size = self.config['discrete_size']
 
-    def prior(self, shape):
-        uniform_probs = float_type(self.config['cuda'])(1, shape[1]).zero_()
-        uniform_probs += 1.0 / shape[1]
+    def prior(self, batch_size):
+        uniform_probs = float_type(self.config['cuda'])(1, self.output_size).zero_()
+        uniform_probs += 1.0 / self.output_size
         cat = torch.distributions.Categorical(uniform_probs)
-        sample = cat.sample_n(shape[0])
+        sample = cat.sample((batch_size,))
         return Variable(
-            one_hot(shape[1], sample, use_cuda=self.config['cuda'])
+            one_hot(self.output_size, sample, use_cuda=self.config['cuda'])
         ).type(float_type(self.config['cuda']))
 
     def _setup_anneal_params(self):
@@ -62,7 +62,7 @@ class GumbelSoftmax(nn.Module):
         # ent = tf.reduce_mean(-tf.reduce_sum(tf.log(prior_sample + eps) * prior_sample, 1))
 
         log_q_z_given_x = params['discrete']['log_q_z'] + eps
-        p_z = self.prior(log_q_z_given_x.size())
+        p_z = self.prior(log_q_z_given_x.size()[0])
         crossent_loss = -torch.sum(log_q_z_given_x * p_z, dim=1)
         ent_loss = -torch.sum(torch.log(p_z + eps) * p_z, dim=1)
         return crossent_loss + ent_loss

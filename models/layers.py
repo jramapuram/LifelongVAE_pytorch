@@ -6,9 +6,9 @@ import numpy as np
 from collections import OrderedDict
 from torchvision.models import resnet18
 
-from models.isotropic_gaussian import IsotropicGaussian
-from models.gumbel import GumbelSoftmax
-from models.mixture import Mixture
+from models.reparameterizers.isotropic_gaussian import IsotropicGaussian
+from models.reparameterizers.gumbel import GumbelSoftmax
+from models.reparameterizers.mixture import Mixture
 from helpers.utils import check_or_create_dir
 
 
@@ -373,3 +373,124 @@ def build_image_downsampler(img_shp, new_shp,
 
     return  nn.AvgPool2d(kernel_size=(kernel_height, kernel_width),
                          stride=stride, padding=padding)
+
+
+def build_relational_conv_encoder(input_shape, filter_depth=32,
+                                  activation_fn=nn.ELU, bilinear_size=(32, 32)):
+    upsampler = nn.Upsample(size=bilinear_size, mode='bilinear')
+    chans = input_shape[0]
+    return nn.Sequential(
+        upsampler if input_shape[1:] != bilinear_size else Identity(),
+        # input dim: num_channels x 32 x 32
+        nn.Conv2d(chans, filter_depth, 5, stride=1, bias=True),
+        nn.BatchNorm2d(filter_depth),
+        activation_fn(inplace=True),
+        # state dim: 32 x 28 x 28
+        nn.Conv2d(filter_depth, filter_depth*2, 4, stride=2, bias=True),
+        nn.BatchNorm2d(filter_depth*2),
+        activation_fn(inplace=True),
+        # state dim: 64 x 13 x 13
+        nn.Conv2d(filter_depth*2, filter_depth*4, 4, stride=1, bias=True),
+        nn.BatchNorm2d(filter_depth*4),
+        activation_fn(inplace=True),
+        # state dim: 128 x 10 x 10
+        nn.Conv2d(filter_depth*4, filter_depth*8, 4, stride=2, bias=True),
+        nn.BatchNorm2d(filter_depth*8),
+        activation_fn(inplace=True),
+        # state dim: 256 x 4 x 4
+    )
+
+
+def build_conv_decoder(input_size, output_shape, filter_depth=32,
+                       activation_fn=nn.ELU, bilinear_size=(32, 32)):
+    chans = output_shape[0]
+    upsampler = nn.Upsample(size=output_shape[1:], mode='bilinear')
+    return nn.Sequential(
+        View([-1, input_size, 1, 1]),
+        # input dim: z_dim x 1 x 1
+        nn.ConvTranspose2d(input_size, filter_depth*8, 4, stride=1, bias=True),
+        nn.BatchNorm2d(filter_depth*8),
+        activation_fn(inplace=True),
+        # state dim:   256 x 4 x 4
+        nn.ConvTranspose2d(filter_depth*8, filter_depth*4, 4, stride=2, bias=True),
+        nn.BatchNorm2d(filter_depth*4),
+        activation_fn(inplace=True),
+        # state dim: 128 x 10 x 10
+        nn.ConvTranspose2d(filter_depth*4, filter_depth*2, 4, stride=1, bias=True),
+        nn.BatchNorm2d(filter_depth*2),
+        activation_fn(inplace=True),
+        # state dim: 64 x 13 x 13
+        nn.ConvTranspose2d(filter_depth*2, filter_depth, 4, stride=2, bias=True),
+        nn.BatchNorm2d(filter_depth),
+        activation_fn(inplace=True),
+        # state dim: 32 x 28 x 28
+        nn.ConvTranspose2d(filter_depth, filter_depth, 5, stride=1, bias=True),
+        nn.BatchNorm2d(filter_depth),
+        activation_fn(inplace=True),
+        # state dim: 32 x 32 x 32
+        nn.Conv2d(filter_depth, chans, 1, stride=1, bias=True),
+        # output dim: num_channels x 32 x 32
+        upsampler if output_shape[1:] != bilinear_size else Identity()
+    )
+
+
+def build_conv_encoder(input_shape, output_size, filter_depth=32,
+                       activation_fn=nn.ELU, bilinear_size=(32, 32)):
+    upsampler = nn.Upsample(size=bilinear_size, mode='bilinear')
+    chans = input_shape[0]
+    return nn.Sequential(
+        upsampler if input_shape[1:] != bilinear_size else Identity(),
+        # input dim: num_channels x 32 x 32
+        nn.Conv2d(chans, filter_depth, 5, stride=1, bias=True),
+        nn.BatchNorm2d(filter_depth),
+        activation_fn(inplace=True),
+        # state dim: 32 x 28 x 28
+        nn.Conv2d(filter_depth, filter_depth*2, 4, stride=2, bias=True),
+        nn.BatchNorm2d(filter_depth*2),
+        activation_fn(inplace=True),
+        # state dim: 64 x 13 x 13
+        nn.Conv2d(filter_depth*2, filter_depth*4, 4, stride=1, bias=True),
+        nn.BatchNorm2d(filter_depth*4),
+        activation_fn(inplace=True),
+        # state dim: 128 x 10 x 10
+        nn.Conv2d(filter_depth*4, filter_depth*8, 4, stride=2, bias=True),
+        nn.BatchNorm2d(filter_depth*8),
+        activation_fn(inplace=True),
+        # state dim: 256 x 4 x 4
+        nn.Conv2d(filter_depth*8, filter_depth*16, 4, stride=1, bias=True),
+        nn.BatchNorm2d(filter_depth*16),
+        activation_fn(inplace=True),
+        # state dim: 512 x 1 x 1
+        nn.Conv2d(filter_depth*16, filter_depth*16, 1, stride=1, bias=True),
+        nn.BatchNorm2d(filter_depth*16),
+        activation_fn(inplace=True),
+        # state dim: 512 x 1 x 1
+        nn.Conv2d(filter_depth*16, output_size, 1, stride=1, bias=True),
+        nn.BatchNorm2d(output_size),
+        activation_fn(inplace=True)
+        # output dim: opt.z_dim x 1 x 1
+    )
+
+def build_dense_encoder(input_shape, output_size, latent_size=512, activation_fn=nn.ELU):
+    return nn.Sequential(
+        View([-1, int(np.prod(input_shape))]),
+        nn.Linear(int(np.prod(input_shape)), latent_size),
+        nn.BatchNorm1d(latent_size),
+        activation_fn(),
+        nn.Linear(latent_size, output_size),
+        nn.BatchNorm1d(output_size),
+        activation_fn()
+    )
+
+def build_dense_decoder(input_size, output_shape, latent_size=512, activation_fn=nn.ELU):
+    return nn.Sequential(
+        View([-1, input_size]),
+        nn.Linear(input_size, latent_size),
+        nn.BatchNorm1d(latent_size),
+        activation_fn(),
+        nn.Linear(latent_size, latent_size),
+        nn.BatchNorm1d(latent_size),
+        activation_fn(),
+        nn.Linear(latent_size, int(np.prod(output_shape))),
+        View([-1] + output_shape)
+    )

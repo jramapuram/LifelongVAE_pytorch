@@ -8,8 +8,8 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 
 from helpers.utils import float_type, ones_like
-from models.gumbel import GumbelSoftmax
-from models.isotropic_gaussian import IsotropicGaussian
+from models.reparameterizers.gumbel import GumbelSoftmax
+from models.reparameterizers.isotropic_gaussian import IsotropicGaussian
 
 
 class Mixture(nn.Module):
@@ -33,10 +33,9 @@ class Mixture(nn.Module):
         self.input_size = num_continuous + num_discrete
         self.output_size = self.discrete.output_size + self.gaussian.output_size
 
-    def prior(self, shape):
-        batch_size = shape[0]
-        disc = self.discrete.prior([batch_size, self.discrete.output_size])
-        cont = self.gaussian.prior([batch_size, self.gaussian.output_size])
+    def prior(self, batch_size):
+        disc = self.discrete.prior(batch_size)
+        cont = self.gaussian.prior(batch_size)
         return torch.cat([cont, disc], 1)
 
     def mutual_info(self, params):

@@ -1,23 +1,22 @@
 import argparse
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import torch.distributions as D
 
 from torch.autograd import Variable
 
-from models.vae import VAE
 from models.fid import train_fid_model
+from models.vae.parallelly_reparameterized_vae import ParallellyReparameterizedVAE
+from models.vae.sequentially_reparameterized_vae import SequentiallyReparameterizedVAE
 from models.student_teacher import StudentTeacher
 from models.layers import Submodel, EarlyStopping, init_weights
 from datasets.loader import get_sequential_data_loaders, get_loader
 from optimizers.adamnormgrad import AdamNormGrad
 from helpers.grapher import Grapher
-from helpers.utils import to_data, softmax_accuracy, expand_dims, \
-    int_type, float_type, long_type, add_weight_norm, ones_like, \
-    squeeze_expand_dim, frechet_gauss_gauss, frechet_gauss_gauss_np, \
+from helpers.utils import to_data, float_type, ones_like, \
+    frechet_gauss_gauss, frechet_gauss_gauss_np, \
     append_to_csv, num_samples_in_loader, zero_pad_smaller_cat
 
 parser = argparse.ArgumentParser(description='LifeLong VAE Pytorch')
@@ -56,18 +55,20 @@ parser.add_argument('--nll-type', type=str, default='bernoulli',
                     help='bernoulli or gaussian (default: bernoulli)')
 parser.add_argument('--lr', type=float, default=1e-3, metavar='LR',
                     help='learning rate (default: 1e-3)')
-parser.add_argument('--seed', type=int, default=None,
-                    help='seed for numpy and pytorch (default: None)')
 parser.add_argument('--mut-reg', type=float, default=0.3,
                     help='mutual information regularizer [mixture only] (default: 0.3)')
 parser.add_argument('--log-interval', type=int, default=10, metavar='N',
                     help='how many batches to wait before logging training status')
 parser.add_argument('--ewc', action='store_true',
                     help='use the EWC regularizer instead')
+parser.add_argument('--vae-type', type=str, default='parallel',
+                    help='vae type [sequential or parallel] (default: parallel)')
 parser.add_argument('--disable-regularizers', action='store_true',
                     help='disables mutual info and consistency regularizers')
 parser.add_argument('--disable-sequential', action='store_true',
                     help='enables standard batch training')
+parser.add_argument('--use-relational-encoder', action='store_true',
+                    help='uses a relational network as the encoder projection layer')
 parser.add_argument('--disable-student-teacher', action='store_true',
                     help='uses a standard VAE without Student-Teacher architecture')
 
@@ -82,6 +83,8 @@ parser.add_argument('--visdom-port', type=int, default="8097",
                     help='visdom port for graphs (default: 8097)')
 
 # Device parameters
+parser.add_argument('--seed', type=int, default=None,
+                    help='seed for numpy and pytorch (default: None)')
 parser.add_argument('--ngpu', type=int, default=1,
                     help='number of gpus available (default: 1)')
 parser.add_argument('--no-cuda', action='store_true', default=False,
@@ -145,13 +148,11 @@ def train(epoch, model, fisher, optimizer, data_loader, grapher):
                 100. * batch_idx * len(data) / num_samples,
                 loss['loss_mean'].data[0], loss['kld_mean'].data[0], loss['nll_mean'].data[0]))
 
-            # gether tau val for discrete annealing if it exists
-            tau_val = output_map['student']['params']['discrete']['tau_scalar'] \
-                      if args.reparam_type == 'discrete' \
-                         or args.reparam_type == 'mixture' else None
+            # gether scalar values of reparameterizers
+            reparam_scalars = model.student.get_reparameterizer_scalars()
 
             # plot images and lines
-            register_plots(loss, grapher, epoch=TOTAL_ITER, tau=tau_val)
+            register_plots({**loss, **reparam_scalars}, grapher, epoch=TOTAL_ITER)
             register_images(output_map['student']['x_reconstr'],
                             output_map['augmented']['data'],
                             grapher)
@@ -161,36 +162,21 @@ def train(epoch, model, fisher, optimizer, data_loader, grapher):
         TOTAL_ITER += 1
 
 
-def register_plots(loss, grapher, epoch, tau=None, prefix='train'):
-    grapher.register_single({'%s_loss' % prefix: [[epoch], [loss['loss_mean'].data[0]]]},
-                            plot_type='line')
-    grapher.register_single({'%s_kld' % prefix: [[epoch], [loss['kld_mean'].data[0]]]},
-                            plot_type='line')
-    grapher.register_single({'%s_nll' % prefix: [[epoch], [loss['nll_mean'].data[0]]]},
-                            plot_type='line')
-    grapher.register_single({'%s_mutinfo' % prefix: [[epoch], [loss['mut_info_mean'].data[0]]]},
-                            plot_type='line')
-    grapher.register_single({'%s_elbo' % prefix: [[epoch], [loss['elbo_mean'].data[0]]]},
-                            plot_type='line')
-    grapher.register_single({'%s_elbo' % prefix: [[epoch], [loss['elbo_mean'].data[0]]]},
-                            plot_type='line')
+def register_plots(loss, grapher, epoch, prefix='train'):
+    for k, v in loss.items():
+        if isinstance(v, map):
+            register_plots(loss[k], grapher, epoch, prefix=prefix)
 
-    if 'ewc_mean' in loss:
-        grapher.register_single({'%s_ewc' % prefix: [[epoch], [loss['ewc_mean'].data[0]]]},
-                                plot_type='line')
-
-    if 'posterior_regularizer_mean' in loss:
-        grapher.register_single(
-            {'%s_posterior_reg' % prefix: [[epoch], [loss['posterior_regularizer_mean'].data[0]]]},
-            plot_type='line')
-
-    if tau:
-        grapher.register_single({'%s_tau' % prefix: [[epoch], [tau]]},plot_type='line')
+        if 'mean' in k or 'scalar' in k:
+            key_name = k.split('_')[0]
+            value = v.data[0] if not isinstance(v, (float, np.float32, np.float64)) else v
+            grapher.register_single({'%s_%s' % (prefix, key_name): [[epoch], [value]]},
+                                    plot_type='line')
 
 
 def register_images(reconstr_x, data, grapher, prefix="train"):
-    reconstr_x = torch.min(reconstr_x, ones_like(reconstr_x, args.cuda))
-    vis_x = torch.min(data, ones_like(data, args.cuda))
+    reconstr_x = torch.min(reconstr_x, ones_like(reconstr_x))
+    vis_x = torch.min(data, ones_like(data))
     grapher.register_single({'%s_reconstructions' % prefix: reconstr_x}, plot_type='imgs')
     grapher.register_single({'%s_inputs' % prefix: vis_x}, plot_type='imgs')
 
@@ -238,13 +224,11 @@ def test(epoch, model, data_loader, grapher):
         loss_map['kld_mean'].data[0],
         loss_map['nll_mean'].data[0]))
 
-    # gather the tau value for the annealing schedule
-    tau_val = output_map['student']['params']['discrete']['tau_scalar'] \
-              if args.reparam_type == 'discrete' \
-                 or args.reparam_type == 'mixture' else None
+    # gether scalar values of reparameterizers
+    reparam_scalars = model.student.get_reparameterizer_scalars()
 
     # plot the test accuracy and loss
-    register_plots(loss_map, grapher, epoch=epoch, tau=tau_val, prefix='test')
+    register_plots({**loss_map, **reparam_scalars}, grapher, epoch=epoch, prefix='test')
     register_images(output_map['student']['x_reconstr'],
                     output_map['augmented']['data'],
                     grapher, 'test')
@@ -334,13 +318,13 @@ def generate(student_teacher, grapher, name='teacher'):
         # random generation
         gen = student_teacher.generate_synthetic_samples(model[name],
                                                          args.batch_size)
-        gen = torch.min(gen, ones_like(gen, args.cuda))
+        gen = torch.min(gen, ones_like(gen))
         grapher.register_single({'generated_%s'%name: gen}, plot_type='imgs')
 
         # sequential generation for discrete and mixture reparameterizations
         if args.reparam_type == 'mixture' or args.reparam_type == 'discrete':
             gen = student_teacher.generate_synthetic_sequential_samples(model[name]).detach()
-            gen = torch.min(gen, ones_like(gen, args.cuda))
+            gen = torch.min(gen, ones_like(gen))
             grapher.register_single({'sequential_generated_%s'%name: gen}, plot_type='imgs')
 
 
@@ -354,8 +338,18 @@ def get_model_and_loader():
 
     # append the image shape to the config & build the VAE
     args.img_shp =  loaders[0].img_shp,
-    vae = VAE(loaders[0].img_shp,
-              kwargs=vars(args))
+    if args.vae_type == 'sequential':
+        # Sequential : P(y|x) --> P(z|y, x) --> P(x|z)
+        # Keep a separate VAE spawn here in case we want
+        # to parameterize the sequence of reparameterizers
+        vae = SequentiallyReparameterizedVAE(loaders[0].img_shp,
+                                             kwargs=vars(args))
+    elif args.vae_type == 'parallel':
+        # Ours: [P(y|x), P(z|x)] --> P(x | z)
+        vae = ParallellyReparameterizedVAE(loaders[0].img_shp,
+                                           kwargs=vars(args))
+    else:
+        raise Exception("unknown VAE type requested")
 
     # build the combiner which takes in the VAE as a parameter
     # and projects the latent representation to the output space
@@ -469,6 +463,8 @@ def run(args):
 
     # collect our optimizer
     optimizer = build_optimizer(model.student)
+    print("there are {} params in the st-model and {} params in the student".format(
+        len(list(model.parameters())), len(list(model.student.parameters()))))
 
     # build a classifier to use for FID
     if args.calculate_fid:
@@ -509,6 +505,8 @@ def run(args):
                 model.fork()
                 lazy_generate_modules(model, data_loaders[0].img_shp)
                 optimizer = build_optimizer(model.student)
+                print("there are {} params in the st-model and {} params in the student".format(
+                    len(list(model.parameters())), len(list(model.student.parameters()))))
 
             grapher.save() # save to json after distributional interval
             grapher = Grapher(env=model.get_name(),

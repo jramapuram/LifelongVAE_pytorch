@@ -3,4 +3,4 @@
 	url = git+ssh://git@github.com/jramapuram/datasets
 [submodule "helpers"]
 	path = helpers
-	url = https://github.com/jramapuram/helpers
+	url = git+ssh://git@github.com/jramapuram/helpers

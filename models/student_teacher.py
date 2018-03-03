@@ -8,7 +8,6 @@ import torch.distributions as D
 from torch.autograd import Variable
 from copy import deepcopy
 
-from models.vae import VAE
 from helpers.utils import expand_dims, long_type, squeeze_expand_dim, \
     ones_like, float_type, pad, invert_shuffle, one_hot_np, \
     zero_pad_smaller_cat, check_or_create_dir
@@ -193,10 +192,19 @@ class StudentTeacher(nn.Module):
         self.teacher = deepcopy(self.student)
 
         # create a new student
-        self.student = VAE(input_shape=self.teacher.input_shape,
-                           num_current_model=self.current_model+1,
-                           **{'kwargs': config_copy}
-        )
+        if self.config['use_sequential_vae']:
+            from models.skip_connection_vae import VAE
+            self.student = VAE(input_shape=self.teacher.input_shape,
+                               num_current_model=self.current_model+1,
+                               reparameterizer_strs=self.teacher.reparameterizer_strs,
+                               **{'kwargs': config_copy}
+            )
+        else:
+            from models.vae import VAE
+            self.student = VAE(input_shape=self.teacher.input_shape,
+                               num_current_model=self.current_model+1,
+                               **{'kwargs': config_copy}
+            )
 
         # forward pass once to build lazy modules
         data = float_type(self.config['cuda'])(self.student.config['batch_size'],
@@ -217,13 +225,11 @@ class StudentTeacher(nn.Module):
               " | #student_samples: ", num_student_samples)
 
     def generate_synthetic_samples(self, model, batch_size):
-        z_samples = model.reparameterizer.prior([batch_size,
-                                                 model.reparameterizer.output_size])
-        return model.nll_activation(model.decode(z_samples))
+        z_samples = model.reparameterizer.prior(batch_size)
+        return model.nll_activation(model.generate(z_samples))
 
     def generate_synthetic_sequential_samples(self, model, num_rows=8):
-        assert self.config['reparam_type'] == 'mixture' \
-            or self.config['reparam_type'] == 'discrete'
+        assert model.has_discrete()
 
         # create a grid of one-hot vectors for displaying in visdom
         # uses one row for original dimension of discrete component
@@ -242,14 +248,12 @@ class StudentTeacher(nn.Module):
                                                              discrete_indices)))
             z_samples = z_samples.type(float_type(self.config['cuda']))
 
-            if self.config['reparam_type'] == 'mixture':
+            if self.config['reparam_type'] == 'mixture' and self.config['vae_type'] != 'sequential':
                 ''' add in the gaussian prior '''
-                z_gauss = model.reparameterizer.gaussian.prior(
-                    [z_samples.size(0), model.reparameterizer.gaussian.output_size]
-                )
+                z_gauss = model.reparameterizer.gaussian.prior(z_samples.size(0))
                 z_samples = torch.cat([z_gauss, z_samples], dim=-1)
 
-            return model.nll_activation(model.decode(z_samples))
+            return model.nll_activation(model.generate(z_samples))
 
     def _augment_data(self, x):
         ''' return batch_size worth of samples that are augmented
@@ -295,8 +299,7 @@ class StudentTeacher(nn.Module):
         if self.teacher is not None:
             # only teacher Q(z|x) is needed, so dont run decode step
             self.teacher.eval()
-            z_logits_teacher = self.teacher.encode(x_augmented)
-            _, params_teacher = self.teacher.reparameterize(z_logits_teacher)
+            _, params_teacher = self.teacher.posterior(x_augmented)
             # detach_from_graph(params_teacher)
             ret_map['teacher']= {
                 'params': params_teacher

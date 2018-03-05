@@ -11,6 +11,8 @@ from copy import deepcopy
 from helpers.utils import expand_dims, long_type, squeeze_expand_dim, \
     ones_like, float_type, pad, invert_shuffle, one_hot_np, \
     zero_pad_smaller_cat, check_or_create_dir
+from models.vae.parallelly_reparameterized_vae import ParallellyReparameterizedVAE
+from models.vae.sequentially_reparameterized_vae import SequentiallyReparameterizedVAE
 
 
 def detach_from_graph(param_map):
@@ -21,7 +23,7 @@ def detach_from_graph(param_map):
             v = v.detach_()
 
 
-def kl_categorical_categorical(dist_a, dist_b, rnd_perm, from_index=0, cuda=False):
+def kl_categorical_categorical(dist_a, dist_b, rnd_perm, from_index=0):
     # invert the shuffle for the KL calculation
     # dist_a_logits = invert_shuffle(dist_a['logits'], rnd_perm) # undo the random perm
     # dist_b_logits = invert_shuffle(dist_b['logits'], rnd_perm) # undo the random perm
@@ -35,12 +37,10 @@ def kl_categorical_categorical(dist_a, dist_b, rnd_perm, from_index=0, cuda=Fals
     # zero pad the smaller categorical
     dist_a_log_softmax, dist_b_log_softmax \
         = zero_pad_smaller_cat(dist_a_log_softmax,
-                               dist_b_log_softmax,
-                               cuda=cuda)
+                               dist_b_log_softmax)
     dist_a_softmax, dist_b_log_softmax \
         = zero_pad_smaller_cat(dist_a_softmax,
-                               dist_b_log_softmax,
-                               cuda=cuda)
+                               dist_b_log_softmax)
 
     delta_log_probs1 = dist_a_log_softmax - dist_b_log_softmax
     return torch.sum(dist_a_softmax * delta_log_probs1, dim=-1)
@@ -101,21 +101,45 @@ class StudentTeacher(nn.Module):
         #return teacher_name + "student_" + self.student.get_name()
         return str(self.config['uid']) + str(self.current_model) + self.student.get_name()
 
-    def posterior_regularizer(self, q_z_given_x_t, q_z_given_x_s):
+    def posterior_regularizer_parallel(self, q_z_given_x_t, q_z_given_x_s):
         ''' Evaluates KL(Q_{\Phi})(z | \hat{x}) || Q_{\phi})(z | \hat{x})) '''
         # TF: kl = self.kl_categorical(p=self.q_z_s_given_x_t, q=self.q_z_t_given_x_t)
         if 'discrete' in q_z_given_x_s and 'discrete' in q_z_given_x_t:
             return kl_categorical_categorical(q_z_given_x_s['discrete'],
                                               q_z_given_x_t['discrete'],
                                               self.rnd_perm,
-                                              from_index=self.num_student_samples,
-                                              cuda=self.config['cuda'])
+                                              from_index=self.num_student_samples)
         elif 'gaussian' in q_z_given_x_s and 'gaussian' in q_z_given_x_t:
             # gauss kl-kl doesnt have any from-index
             return kl_isotropic_gauss_gauss(q_z_given_x_s['gaussian'],
                                             q_z_given_x_t['gaussian'])
         else:
             raise NotImplementedError("unknown distribution requested for kl")
+
+    def posterior_regularizer_sequential(self, q_z_given_x_t, q_z_given_x_s):
+        ''' Evaluates KL(Q_{\Phi})(z | \hat{x}) || Q_{\phi})(z | \hat{x}))
+            over all the discrete pairs
+            TODO: consider logic for gauss kl'''
+        # TF: kl = self.kl_categorical(p=self.q_z_s_given_x_t, q=self.q_z_t_given_x_t)
+        num_params = len(q_z_given_x_s) // 2
+        batch_size, kl = q_z_given_x_s['z_0'].size(0), None
+        for i in range(num_params):
+            if 'discrete' in q_z_given_x_s['params_%d'%i]:
+                kl_tmp = kl_categorical_categorical(q_z_given_x_s['params_%d'%i]['discrete'],
+                                                    q_z_given_x_t['params_%d'%i]['discrete'],
+                                                    self.rnd_perm,
+                                                    from_index=self.num_student_samples)
+                kl = kl_tmp if kl is None else kl + kl_tmp
+
+        return kl
+
+    def posterior_regularizer(self, q_z_given_x_t, q_z_given_x_s):
+        ''' helper to separate posterior regularization for seq / parallel '''
+        posterior_fn_map = {
+            'sequential': self.posterior_regularizer_sequential,
+            'parallel': self.posterior_regularizer_parallel
+        }
+        return posterior_fn_map[self.config['vae_type']](q_z_given_x_t, q_z_given_x_s)
 
     def _lifelong_loss_function(self, output_map):
         ''' returns a combined loss of the VAE loss
@@ -130,8 +154,7 @@ class StudentTeacher(nn.Module):
             posterior_regularizer = pad(posterior_regularizer,
                                         diff,
                                         dim=0,
-                                        prepend=True,
-                                        cuda=self.config['cuda'])
+                                        prepend=True)
             # posterior_regularizer = posterior_regularizer[self.rnd_perm]
             # posterior_regularizer = invert_shuffle(posterior_regularizer, self.rnd_perm)
             vae_loss['loss_mean'] = torch.mean(vae_loss['loss'] + posterior_regularizer)
@@ -192,19 +215,20 @@ class StudentTeacher(nn.Module):
         self.teacher = deepcopy(self.student)
 
         # create a new student
-        if self.config['use_sequential_vae']:
-            from models.skip_connection_vae import VAE
-            self.student = VAE(input_shape=self.teacher.input_shape,
-                               num_current_model=self.current_model+1,
-                               reparameterizer_strs=self.teacher.reparameterizer_strs,
-                               **{'kwargs': config_copy}
+        if self.config['vae_type'] == 'sequential':
+            self.student = SequentiallyReparameterizedVAE(input_shape=self.teacher.input_shape,
+                                                          num_current_model=self.current_model+1,
+                                                          reparameterizer_strs=self.teacher.reparameterizer_strs,
+                                                          **{'kwargs': config_copy}
+            )
+        elif self.config['vae_type'] == 'parallel':
+            self.student = ParallellyReparameterizedVAE(input_shape=self.teacher.input_shape,
+                                                        num_current_model=self.current_model+1,
+                                                        **{'kwargs': config_copy}
             )
         else:
-            from models.vae import VAE
-            self.student = VAE(input_shape=self.teacher.input_shape,
-                               num_current_model=self.current_model+1,
-                               **{'kwargs': config_copy}
-            )
+            raise Exception("unknown vae type requested")
+
 
         # forward pass once to build lazy modules
         data = float_type(self.config['cuda'])(self.student.config['batch_size'],
@@ -258,7 +282,7 @@ class StudentTeacher(nn.Module):
     def _augment_data(self, x):
         ''' return batch_size worth of samples that are augmented
             from the teacher model '''
-        if self.ratio == 1.0 or not self.training: #or self.config['ewc']:
+        if self.ratio == 1.0 or not self.training or self.config['disable_augmentation']:
             return x   # base case
 
         batch_size = x.size(0)

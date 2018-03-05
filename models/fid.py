@@ -12,8 +12,8 @@ from optimizers.adamnormgrad import AdamNormGrad
 from models.layers import View, Identity, flatten_layers, EarlyStopping
 from datasets.loader import get_loader
 from datasets.utils import GenericLoader, simple_merger
-from helpers.utils import float_type, zeros_like, ones_like, \
-    softmax_accuracy, check_or_create_dir
+from helpers.utils import float_type, check_or_create_dir
+from helpers.metrics import softmax_accuracy
 
 
 def build_optimizer(model, args):
@@ -105,14 +105,11 @@ def lazy_generate_modules(model, img_shp, batch_size, cuda):
     model(Variable(data))
 
 
-def train_fid_model(reparameterizer_input_size,
-                    reparameterizer_output_size,
-                    args):
+def train_fid_model(args):
     ''' builds and trains a classifier '''
     loader = get_loader(args)
     if isinstance(loader, list): # has a sequential loader
-        # loader = simple_merger(loader, args.batch_size, args.cuda)
-        loader = loader[0]
+        loader = simple_merger(loader, args.batch_size, args.cuda)
 
     model = FID(loader.img_shp,
                 loader.output_size,
@@ -205,7 +202,7 @@ class FID(nn.Module):
                                                      .replace('\'', '')
         # tasks_cleaned = [t.split('_')[1] if 'rotated' in t else t for t in self.config['task']]
         # return 'fid_' + '_'.join(tasks_cleaned) + full_hash_str
-        return 'fid_' + '_'.join(self.config['task']) + full_hash_str
+        return 'fid_' + str(self.config['task']) + full_hash_str
 
 
     def build_encoder(self):

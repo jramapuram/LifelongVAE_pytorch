@@ -36,6 +36,7 @@ class SequentiallyReparameterizedVAE(AbstractVAE):
         self.reparameterizer_strs = reparameterizer_strs
         self.reparameterizers, self.reparameterizer \
             = self._build_sequential_reparameterizers(reparameterizer_strs)
+        print(self.reparameterizers)
 
         # build the encoder and decoder
         self.encoder = self.build_encoder()
@@ -44,6 +45,7 @@ class SequentiallyReparameterizedVAE(AbstractVAE):
     def _build_sequential_reparameterizers(self, reparam_str_list):
         ''' helper to build all the reparameterizers '''
         reparameterizers = []
+        encoder_output_size = None
         for reparam_str in reparam_str_list:
             if reparam_str == "isotropic_gaussian":
                 print("adding isotropic gaussian reparameterizer")
@@ -59,10 +61,15 @@ class SequentiallyReparameterizedVAE(AbstractVAE):
             else:
                 raise Exception("unknown reparameterization type")
 
+            # the encoder projects to the first reparameterization's
+            # input_size, so tabulate this to use in all the seq models below
+            if encoder_output_size is None:
+                encoder_output_size = reparameterizers[-1].input_size
+
             # tweak the reparameterizer to add a dense skip-network
             # XXX: parameterize the latent size
             reparameterizers[-1] = nn.Sequential(
-                nn.Linear(reparameterizers[-1].input_size, 512),
+                nn.Linear(encoder_output_size, 512),
                 nn.BatchNorm1d(512),
                 self.activation_fn(),
                 nn.Linear(512, reparameterizers[-1].input_size),
@@ -87,12 +94,14 @@ class SequentiallyReparameterizedVAE(AbstractVAE):
         param_str = ""
         for reparam_str in self.reparameterizer_strs:
             if reparam_str == "mixture":
-                param_str += "mixture_disc" + str(self.config['discrete_size']) + \
-                            "_cont" + str(self.config['continuous_size'])
+                param_str += "mixturecat{}gauss{}_".format(
+                    str(self.config['discrete_size']),
+                    str(self.config['continuous_size'])
+                )
             elif reparam_str == "isotropic_gaussian":
-                param_str += "gauss_cont" + str(self.config['continuous_size'])
+                param_str += "gauss{}_".format(str(self.config['continuous_size']))
             elif reparam_str == "discrete":
-                param_str += "cat_disc" + str(self.config['discrete_size'])
+                param_str += "cat{}_".format(str(self.config['discrete_size']))
 
         return 'seqvae_' + super(SequentiallyReparameterizedVAE, self).get_name(param_str)
 

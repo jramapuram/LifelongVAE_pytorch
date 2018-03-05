@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 from torch.autograd import Variable
 
-from helpers.utils import to_data, softmax_accuracy, expand_dims, \
+from helpers.utils import to_data, expand_dims, \
     int_type, float_type, long_type, add_weight_norm
 
 

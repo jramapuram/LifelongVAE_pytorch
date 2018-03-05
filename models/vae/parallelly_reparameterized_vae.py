@@ -39,12 +39,14 @@ class ParallellyReparameterizedVAE(AbstractVAE):
 
     def get_name(self):
         if self.config['reparam_type'] == "mixture":
-            reparam_str = "_disc" + str(self.config['discrete_size']) + \
-                        "_cont" + str(self.config['continuous_size'])
+            reparam_str = "mixturecat{}gauss{}_".format(
+                str(self.config['discrete_size']),
+                str(self.config['continuous_size'])
+            )
         elif self.config['reparam_type'] == "isotropic_gaussian":
-            reparam_str = "_cont" + str(self.config['continuous_size'])
+            reparam_str = "cont{}_".format(str(self.config['continuous_size']))
         elif self.config['reparam_type'] == "discrete":
-            reparam_str = "_disc" + str(self.config['discrete_size'])
+            reparam_str = "disc{}_".format(str(self.config['discrete_size']))
         else:
             raise Exception("unknown reparam type")
 

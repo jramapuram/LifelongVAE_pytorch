@@ -1,9 +1,8 @@
 import argparse
 import numpy as np
+import pprint
 import torch
 import torch.optim as optim
-import torch.nn.functional as F
-import torch.distributions as D
 
 from torch.autograd import Variable
 
@@ -11,22 +10,22 @@ from models.fid import train_fid_model
 from models.vae.parallelly_reparameterized_vae import ParallellyReparameterizedVAE
 from models.vae.sequentially_reparameterized_vae import SequentiallyReparameterizedVAE
 from models.student_teacher import StudentTeacher
-from models.layers import Submodel, EarlyStopping, init_weights
-from datasets.loader import get_sequential_data_loaders, get_loader
+from models.layers import EarlyStopping, init_weights
+from datasets.loader import get_split_data_loaders, get_loader
 from optimizers.adamnormgrad import AdamNormGrad
 from helpers.grapher import Grapher
-from helpers.utils import to_data, float_type, ones_like, \
-    frechet_gauss_gauss, frechet_gauss_gauss_np, \
-    append_to_csv, num_samples_in_loader, zero_pad_smaller_cat
+from helpers.metrics import calculate_consistency, calculate_fid, estimate_fisher
+from helpers.utils import float_type, ones_like, \
+    append_to_csv, num_samples_in_loader
 
 parser = argparse.ArgumentParser(description='LifeLong VAE Pytorch')
 
 # Task parameters
 parser.add_argument('--uid', type=str, default="",
                     help="add a custom task-specific unique id; appended to name (default: None)")
-parser.add_argument('--task', nargs='+', default="mnist",
+parser.add_argument('--task', type=str, default="mnist",
                     help="""task to work on (can specify multiple) [mnist / cifar10 /
-                    fashion / svhn_centered / svhn / clutter / merged] (default: mnist)""")
+                    fashion / svhn_centered / svhn / clutter / permuted] (default: mnist)""")
 parser.add_argument('--epochs', type=int, default=10, metavar='N',
                     help='minimum number of epochs to train (default: 10)')
 parser.add_argument('--continuous-size', type=int, default=32, metavar='L',
@@ -67,6 +66,8 @@ parser.add_argument('--disable-regularizers', action='store_true',
                     help='disables mutual info and consistency regularizers')
 parser.add_argument('--disable-sequential', action='store_true',
                     help='enables standard batch training')
+parser.add_argument('--disable-augmentation', action='store_true',
+                    help='disables student-teacher data augmentation')
 parser.add_argument('--use-relational-encoder', action='store_true',
                     help='uses a relational network as the encoder projection layer')
 parser.add_argument('--disable-student-teacher', action='store_true',
@@ -241,72 +242,6 @@ def test(epoch, model, data_loader, grapher):
     return loss_val
 
 
-def calculate_fid_between_models(fid_model, model, data_loader,
-                                 lifelong_layer_index=-13, fid_layer_index=-4):
-    ''' Extract features and computes the FID score for the VAE vs. the classifier
-        NOTE: expects a trained fid classifier and model '''
-    fid_submodel = Submodel(fid_model, layer_index=fid_layer_index)
-    lifelong_submodel = Submodel(model.student, layer_index=lifelong_layer_index)
-    fid_submodel.eval()
-    lifelong_submodel.eval()
-
-    # keep track of the running frechet dist
-    frechet_dist, count = 0.0, 0
-
-    for data, _ in data_loader.test_loader:
-        data = Variable(data).cuda() if args.cuda else Variable(data)
-        with torch.no_grad():
-            batch_size = data.size(0)
-
-            # extract features from both the models
-            fid_features = fid_submodel(data).view(batch_size, -1)
-            lifelong_features = lifelong_submodel(data).view(batch_size, -1)
-
-            # compute frechet distance
-            frechet_dist += frechet_gauss_gauss(
-                D.Normal(torch.mean(fid_features, dim=1), torch.var(fid_features, dim=1)),
-                D.Normal(torch.mean(lifelong_features, dim=1), torch.var(lifelong_features, dim=1))
-            )
-            count += 1
-
-    frechet_dist /= count
-    frechet_dist = frechet_dist.cpu().numpy()
-    print("frechet distance over {} samples: {}\n".format(
-        count*args.batch_size, frechet_dist)
-    )
-    return frechet_dist
-
-
-def calculate_fid_from_generated_images(fid_model, model, data_loader, fid_layer_index=-4):
-    ''' Extract features and computes the FID score for the VAE vs. the classifier
-        NOTE: expects a trained fid classifier and model '''
-    fid_submodel = Submodel(fid_model, layer_index=fid_layer_index)
-    fid_submodel.eval()
-    model.eval()
-
-    # calculate how many synthetic images from the student model
-    num_test_samples = num_samples_in_loader(data_loader.test_loader)
-    num_synthetic = int(np.ceil(num_test_samples // args.batch_size))
-    fid, count = 0.0, 0
-
-    with torch.no_grad():
-        synthetic = [model.generate_synthetic_samples(model.student, args.batch_size)
-                     for _ in range(num_synthetic + 1)]
-        for (data, _), generated in zip(data_loader.test_loader, synthetic):
-            data = Variable(data).cuda() if args.cuda else Variable(data)
-            fid += frechet_gauss_gauss(
-                D.Normal(torch.mean(fid_submodel(generated), dim=0), torch.var(fid_submodel(generated), dim=0)),
-                D.Normal(torch.mean(fid_submodel(data), dim=0), torch.var(fid_submodel(data), dim=0))
-            ).cpu().numpy()
-            count += 1
-
-    frechet_dist = fid / count
-    print("frechet distance [ {} samples ]: {}\n".format(
-        (num_test_samples // args.batch_size) * args.batch_size, frechet_dist)
-    )
-    return frechet_dist
-
-
 def generate(student_teacher, grapher, name='teacher'):
     model = {
         'teacher': student_teacher.teacher,
@@ -334,7 +269,11 @@ def get_model_and_loader():
         loaders = get_loader(args)
         loaders = [loaders] if not isinstance(loaders, list) else loaders
     else: # classes split
-        loaders = get_sequential_data_loaders(args, num_classes=10)
+        loaders = get_split_data_loaders(args, num_classes=10)
+
+    for l in loaders:
+        print("train = ", num_samples_in_loader(l.train_loader),
+              " | test = ", num_samples_in_loader(l.test_loader))
 
     # append the image shape to the config & build the VAE
     args.img_shp =  loaders[0].img_shp,
@@ -364,93 +303,19 @@ def get_model_and_loader():
     return [student_teacher, loaders, grapher]
 
 
-def estimate_fisher(model, data_loader, sample_size=1024):
-    # modified from github user kuc2477's code
-    # sample loglikelihoods from the dataset.
-    loglikelihoods = []
-    for x, _ in data_loader.train_loader:
-        x = Variable(x).cuda() if args.cuda else Variable(x)
-        reconstr_x, params = model.teacher(x)
-        loss_teacher = model.teacher.loss_function(reconstr_x, x, params)
-        loglikelihoods.append(
-            loss_teacher['loss']
-        )
-        if len(loglikelihoods) >= sample_size // args.batch_size:
-            break
-
-    # estimate the fisher information of the parameters.
-    loglikelihood = torch.cat(loglikelihoods, 0).mean(0)
-    loglikelihood_grads = torch.autograd.grad(
-        loglikelihood, model.teacher.parameters()
-    )
-    parameter_names = [
-        n.replace('.', '__') for n, p in model.teacher.named_parameters()
-    ]
-    return {n: g**2 for n, g in zip(parameter_names, loglikelihood_grads)}
-
-
 def lazy_generate_modules(model, img_shp):
     ''' Super hax, but needed for building lazy modules '''
     model.eval()
     data = float_type(args.cuda)(args.batch_size, *img_shp).normal_()
     model(Variable(data))
 
-def calculate_consistency(model, loader):
-    ''' \sum z_d(teacher) == z_d(student) forall test samples '''
-    consistency = 0.0
-
-    if model.current_model > 0 and (args.reparam_type == 'mixture'
-                                    or args.reparam_type == 'discrete'):
-        model.eval() # prevents data augmentation
-        consistency = []
-
-        for img, _ in loader.test_loader:
-            with torch.no_grad():
-                img = Variable(img).cuda() if args.cuda else Variable(img)
-
-                output_map = model(img)
-                teacher_posterior = output_map['teacher']['params']['discrete']['logits']
-                student_posterior = output_map['student']['params']['discrete']['logits']
-                teacher_posterior = F.softmax(teacher_posterior, dim=-1)
-                student_posterior = F.softmax(student_posterior, dim=-1)
-                teacher_posterior, student_posterior \
-                    = zero_pad_smaller_cat(teacher_posterior, student_posterior,
-                                           cuda=args.cuda)
-
-                correct = to_data(teacher_posterior).max(1)[1] \
-                          == to_data(student_posterior).max(1)[1]
-                consistency.append(torch.mean(correct.type(float_type(args.cuda))))
-                # print("teacher = ", teacher_posterior)
-                # print("student = ", student_posterior)
-                # print("consistency[-1]=", correct)
-
-        num_test_samples = num_samples_in_loader(loader.test_loader)
-        consistency = np.mean(consistency)
-        print("Consistency [#samples: {}]: {}\n".format(num_test_samples,
-                                                      consistency))
-    return np.asarray([consistency])
-
-
-def calculate_fid(fid_model, model, loader, grapher, across_models=False):
-    # evaluate and cache away the FID score
-    fid = np.inf
-    if args.calculate_fid:
-        if across_models:
-            # weird way
-            fid = calculate_fid_between_models(fid_model, model, loader)
-        else:
-            # standard way
-            fid = calculate_fid_from_generated_images(fid_model, model, loader)
-
-        grapher.vis.text(str(fid), opts=dict(title="FID"))
-
-    return fid
 
 def test_and_generate(epoch, model, loader, grapher):
     test_loss = test(epoch, model, loader, grapher)
     generate(model, grapher, 'student') # generate student samples
     generate(model, grapher, 'teacher') # generate teacher samples
     return test_loss
+
 
 def run(args):
     # collect our model and data loader
@@ -468,9 +333,7 @@ def run(args):
 
     # build a classifier to use for FID
     if args.calculate_fid:
-        fid_model = train_fid_model(model.student.reparameterizer.input_size,
-                                    model.student.reparameterizer.output_size,
-                                    args)
+        fid_model = train_fid_model(args)
 
     # main training loop
     for j, loader in enumerate(data_loaders):
@@ -492,10 +355,13 @@ def run(args):
 
         # evaluate one-time metrics
         append_to_csv([test_loss], "{}_test_elbo.csv".format(args.uid))
-        append_to_csv(calculate_consistency(model, loader),
+        append_to_csv(calculate_consistency(model, loader, args.reparam_type, args.vae_type, args.cuda),
                       "{}_consistency.csv".format(args.uid))
+        grapher.vis.text(pprint.PrettyPrinter(indent=4).pformat(model.student.config),
+                         opts=dict(title="config"))
+
         if args.calculate_fid:
-            append_to_csv(calculate_fid(fid_model, model, loader, grapher),
+            append_to_csv(calculate_fid(fid_model, model, loader, grapher, args.batch_size, args.cuda),
                           "{}_fid.csv".format(args.uid))
 
         if j != len(data_loaders) - 1:
@@ -515,7 +381,7 @@ def run(args):
 
             if args.ewc:
                 # calculate the fisher from the previous data loader
-                fisher = estimate_fisher(model, loader) if args.ewc else None
+                fisher = estimate_fisher(model, loader, args.batch_size, cuda=args.cuda) if args.ewc else None
 
 
 if __name__ == "__main__":

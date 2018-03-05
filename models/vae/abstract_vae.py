@@ -36,15 +36,23 @@ class AbstractVAE(nn.Module):
 
     def get_name(self, reparam_str):
         ''' helper to get the name of the model '''
-        full_hash_str = "_{}_{}_input{}_batch{}_mut{}_filterdepth{}_nll{}_lr{}_ngpu{}".format(
+        es_str = "es" + str(int(self.config['early_stop'])) if self.config['early_stop'] \
+                 else "epochs" + str(self.config['epochs'])
+        full_hash_str = "_{}_{}act{}_da{}_st{}_ewc{}_dr{}_input{}_batch{}_mut{}_filter{}_nll{}_lr{}_{}_ngpu{}".format(
             str(self.config['layer_type']),
             reparam_str,
+            str(self.activation_fn.__name__),
+            str(int(self.config['disable_augmentation'])),
+            str(int(not self.config['disable_student_teacher'])),
+            str(int(self.config['ewc'])),
+            str(int(self.config['disable_regularizers'])),
             str(self.input_shape),
             str(self.config['batch_size']),
             str(self.config['mut_reg']),
             str(self.config['filter_depth']),
             str(self.config['nll_type']),
             str(self.config['lr']),
+            es_str,
             str(self.config['ngpu'])
         )
         full_hash_str = full_hash_str.strip().lower().replace('[', '')  \
@@ -57,7 +65,7 @@ class AbstractVAE(nn.Module):
                                                      .replace('(', '') \
                                                      .replace(')', '') \
                                                      .replace('\'', '')
-        return '_'.join(self.config['task']) + full_hash_str
+        return str(self.config['task']) + full_hash_str
 
     def build_encoder(self):
         ''' helper function to build convolutional or dense encoder '''

@@ -4,11 +4,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.autograd import Variable
-from collections import OrderedDict
+from collections import OrderedDict, Counter
 
 from helpers.utils import float_type
 from models.relational_network import RelationalNetwork
-from models.layers import View, flatten_layers, \
+from helpers.layers import View, flatten_layers, \
     build_conv_encoder, build_dense_encoder, \
     build_relational_conv_encoder, build_conv_decoder, \
     build_dense_decoder
@@ -65,7 +65,22 @@ class AbstractVAE(nn.Module):
                                                      .replace('(', '') \
                                                      .replace(')', '') \
                                                      .replace('\'', '')
-        return str(self.config['task']) + full_hash_str
+        task_cleaned = AbstractVAE._clean_task_str(self.config['task'])
+        return task_cleaned + full_hash_str
+
+    @staticmethod
+    def _clean_task_str(task_str):
+        ''' helper to reduce string length.
+            eg: mnist+svhn+mnist --> mnist2svhn1 '''
+        result_str = ''
+        if '+' in task_str:
+            splits = Counter(task_str.split('+'))
+            for k, v in splits.items():
+                result_str += '{}{}'.format(k, v)
+
+            return result_str
+
+        return task_str
 
     def build_encoder(self):
         ''' helper function to build convolutional or dense encoder '''

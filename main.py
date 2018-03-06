@@ -6,14 +6,14 @@ import torch.optim as optim
 
 from torch.autograd import Variable
 
-from models.fid import train_fid_model
 from models.vae.parallelly_reparameterized_vae import ParallellyReparameterizedVAE
 from models.vae.sequentially_reparameterized_vae import SequentiallyReparameterizedVAE
 from models.student_teacher import StudentTeacher
-from models.layers import EarlyStopping, init_weights
+from helpers.layers import EarlyStopping, init_weights
 from datasets.loader import get_split_data_loaders, get_loader
 from optimizers.adamnormgrad import AdamNormGrad
 from helpers.grapher import Grapher
+from helpers.fid import train_fid_model
 from helpers.metrics import calculate_consistency, calculate_fid, estimate_fisher
 from helpers.utils import float_type, ones_like, \
     append_to_csv, num_samples_in_loader
@@ -36,8 +36,8 @@ parser.add_argument('--download', type=int, default=1,
                     help='download dataset from s3 (default: 1)')
 parser.add_argument('--data-dir', type=str, default='./.datasets', metavar='DD',
                     help='directory which contains input data')
-parser.add_argument('--calculate-fid', action='store_true',
-                    help='calculate FID score (default: False)')
+parser.add_argument('--calculate-fid-with', type=str, default=None,
+                    help='enables FID calc & uses model conv/inceptionv3  (default: None)')
 parser.add_argument('--early-stop', action='store_true',
                     help='enable early stopping (default: False)')
 
@@ -332,8 +332,11 @@ def run(args):
         len(list(model.parameters())), len(list(model.student.parameters()))))
 
     # build a classifier to use for FID
-    if args.calculate_fid:
-        fid_model = train_fid_model(args)
+    if args.calculate_fid_with is not None:
+        fid_batch_size = args.batch_size if args.calculate_fid_with == 'conv' else 32
+        fid_model = train_fid_model(args,
+                                    args.calculate_fid_with,
+                                    fid_batch_size)
 
     # main training loop
     for j, loader in enumerate(data_loaders):
@@ -360,8 +363,13 @@ def run(args):
         grapher.vis.text(pprint.PrettyPrinter(indent=4).pformat(model.student.config),
                          opts=dict(title="config"))
 
-        if args.calculate_fid:
-            append_to_csv(calculate_fid(fid_model, model, loader, grapher, args.batch_size, args.cuda),
+        if args.calculate_fid_with is not None:
+            num_fid_samples = 4000 if args.calculate_fid_with != 'inceptionv3' else 1000
+            append_to_csv(calculate_fid(fid_model=fid_model,
+                                        model=model,
+                                        loader=loader, grapher=grapher,
+                                        num_samples=num_fid_samples,
+                                        cuda=args.cuda),
                           "{}_fid.csv".format(args.uid))
 
         if j != len(data_loaders) - 1:

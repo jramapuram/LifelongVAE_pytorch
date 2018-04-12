@@ -147,7 +147,7 @@ def train(epoch, model, fisher, optimizer, data_loader, grapher):
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}\tKLD: {:.4f}\tNLL: {:.4f}'.format(
                 epoch, batch_idx * len(data), num_samples,
                 100. * batch_idx * len(data) / num_samples,
-                loss['loss_mean'].data[0], loss['kld_mean'].data[0], loss['nll_mean'].data[0]))
+                loss['loss_mean'].item(), loss['kld_mean'].item(), loss['nll_mean'].item()))
 
             # gether scalar values of reparameterizers
             reparam_scalars = model.student.get_reparameterizer_scalars()
@@ -170,7 +170,7 @@ def register_plots(loss, grapher, epoch, prefix='train'):
 
         if 'mean' in k or 'scalar' in k:
             key_name = k.split('_')[0]
-            value = v.data[0] if not isinstance(v, (float, np.float32, np.float64)) else v
+            value = v.item() if not isinstance(v, (float, np.float32, np.float64)) else v
             grapher.register_single({'%s_%s' % (prefix, key_name): [[epoch], [value]]},
                                     plot_type='line')
 
@@ -221,9 +221,9 @@ def test(epoch, model, data_loader, grapher):
 
     loss_map = _mean_map(loss_map) # reduce the map to get actual means
     print('\nTest set: Average loss: {:.4f}\tKLD: {:.4f}\tNLL: {:.4f}\n'.format(
-        loss_map['loss_mean'].data[0],
-        loss_map['kld_mean'].data[0],
-        loss_map['nll_mean'].data[0]))
+        loss_map['loss_mean'].item(),
+        loss_map['kld_mean'].item(),
+        loss_map['nll_mean'].item()))
 
     # gether scalar values of reparameterizers
     reparam_scalars = model.student.get_reparameterizer_scalars()

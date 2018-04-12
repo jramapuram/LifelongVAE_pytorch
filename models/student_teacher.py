@@ -196,7 +196,16 @@ class StudentTeacher(nn.Module):
         return self._lifelong_loss_function(output_map)
 
     @staticmethod
-    def copy_model(src, dest, disable_dst_grads=False):
+    def disable_bn(module):
+        for layer in module.children():
+            if isinstance(layer, (nn.Sequential, nn.ModuleList)):
+                StudentTeacher.disable_bn(layer)
+            elif isinstance(layer, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                print("reseting {} parameters".format(layer))
+                layer.reset_parameters()
+
+    @staticmethod
+    def copy_model(src, dest, disable_dst_grads=False, reset_dest_bn=True):
         src_params = list(src.parameters())
         dest_params = list(dest.parameters())
         for i in range(len(src_params)):
@@ -205,6 +214,10 @@ class StudentTeacher(nn.Module):
 
             if disable_dst_grads:
                 dest_params[i].requires_grad = False
+
+        # reset batch norm layers
+        if reset_dest_bn:
+            StudentTeacher.disable_bn(dest)
 
         return [src, dest]
 

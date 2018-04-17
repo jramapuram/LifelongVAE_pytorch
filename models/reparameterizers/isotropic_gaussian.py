@@ -45,7 +45,7 @@ class IsotropicGaussian(nn.Module):
     def _kld_gaussian_N_0_1(mu, logvar):
         standard_normal = D.Normal(zeros_like(mu), ones_like(logvar))
         normal = D.Normal(mu, logvar)
-        return D.kl_divergence(normal, standard_normal)
+        return torch.sum(D.kl_divergence(normal, standard_normal), -1)
 
     def kl(self, dist_a):
         return IsotropicGaussian._kld_gaussian_N_0_1(

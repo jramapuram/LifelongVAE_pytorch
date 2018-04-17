@@ -232,7 +232,7 @@ class AbstractVAE(nn.Module):
             # mut_info = self.config['mut_reg'] * mut_info
             mut_info = self.config['mut_reg'] * (mut_info / torch.norm(mut_info, p=2))
 
-        loss = elbo + mut_info
+        loss = elbo - mut_info
         return {
             'loss': loss,
             'loss_mean': torch.mean(loss),

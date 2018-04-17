@@ -62,7 +62,7 @@ class Mixture(nn.Module):
     def kl(self, dist_a):
         gauss_kl = self.gaussian.kl(dist_a)
         disc_kl = self.discrete.kl(dist_a)
-        return torch.cat([gauss_kl, disc_kl], dim=1)
+        return gauss_kl + disc_kl
 
     def forward(self, logits):
         return self.reparmeterize(logits)

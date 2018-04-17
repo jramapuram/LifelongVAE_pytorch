@@ -66,8 +66,6 @@ class GumbelSoftmax(nn.Module):
         crossent_loss = -torch.sum(log_q_z_given_x * p_z, dim=1)
         ent_loss = -torch.sum(torch.log(p_z + eps) * p_z, dim=1)
         return crossent_loss + ent_loss
-        # return torch.mean(crossent_loss + ent_loss)
-        # return torch.mean(crossent_loss) + torch.mean(ent_loss)
 
     @staticmethod
     def _kld_categorical_uniform(log_q_z, eps=1e-9):
@@ -79,9 +77,9 @@ class GumbelSoftmax(nn.Module):
 
 
     def kl(self, dist_a):
-        return GumbelSoftmax._kld_categorical_uniform(
+        return torch.sum(GumbelSoftmax._kld_categorical_uniform(
             dist_a['discrete']['log_q_z'],
-        )
+        ), dim=-1)
 
     @staticmethod
     def _gumbel_softmax(x, tau, eps=1e-9, use_cuda=False):

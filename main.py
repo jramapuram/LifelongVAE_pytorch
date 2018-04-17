@@ -1,3 +1,4 @@
+import os
 import argparse
 import numpy as np
 import pprint
@@ -16,7 +17,7 @@ from helpers.grapher import Grapher
 from helpers.fid import train_fid_model
 from helpers.metrics import calculate_consistency, calculate_fid, estimate_fisher
 from helpers.utils import float_type, ones_like, \
-    append_to_csv, num_samples_in_loader
+    append_to_csv, num_samples_in_loader, check_or_create_dir
 
 parser = argparse.ArgumentParser(description='LifeLong VAE Pytorch')
 
@@ -36,6 +37,8 @@ parser.add_argument('--download', type=int, default=1,
                     help='download dataset from s3 (default: 1)')
 parser.add_argument('--data-dir', type=str, default='./.datasets', metavar='DD',
                     help='directory which contains input data')
+parser.add_argument('--output-dir', type=str, default='./experiments', metavar='OD',
+                    help='directory which contains csv results')
 parser.add_argument('--calculate-fid-with', type=str, default=None,
                     help='enables FID calc & uses model conv/inceptionv3  (default: None)')
 parser.add_argument('--early-stop', action='store_true',
@@ -60,6 +63,8 @@ parser.add_argument('--log-interval', type=int, default=10, metavar='N',
                     help='how many batches to wait before logging training status')
 parser.add_argument('--ewc', action='store_true',
                     help='use the EWC regularizer instead')
+parser.add_argument('--ewc-gamma', type=float, default=10000,
+                    help='if using ewc this is the hyper-parameter (default: 10k)')
 parser.add_argument('--vae-type', type=str, default='parallel',
                     help='vae type [sequential or parallel] (default: parallel)')
 parser.add_argument('--disable-regularizers', action='store_true',
@@ -131,11 +136,11 @@ def train(epoch, model, fisher, optimizer, data_loader, grapher):
         # zero gradients on optimizer
         optimizer.zero_grad()
 
-        # run the VAE + the DNN on the latent space
+        # run the VAE and extract loss
         output_map = model(data)
         loss = model.loss_function(output_map, fisher)
 
-        # compute loss
+        # compute loss and do a backward pass
         loss['loss_mean'].backward()
         optimizer.step()
 
@@ -236,7 +241,7 @@ def test(epoch, model, data_loader, grapher):
     grapher.show()
 
     # return this for early stopping
-    loss_val = loss_map['elbo_mean'].detach().data[0]
+    loss_val = loss_map['elbo_mean'].detach().item()
     loss_map.clear()
     output_map.clear()
     return loss_val
@@ -340,9 +345,9 @@ def run(args):
 
     # main training loop
     for j, loader in enumerate(data_loaders):
-        num_epochs = args.epochs #+ np.random.randint(0, 13)
+        num_epochs = args.epochs # TODO: randomize epochs by: + np.random.randint(0, 13)
         print("training current distribution for {} epochs".format(num_epochs))
-        early = EarlyStopping(model, max_steps=50) if args.early_stop else None
+        early = EarlyStopping(model, max_steps=50, burn_in_interval=100) if args.early_stop else None
 
         test_loss = 0.
         for epoch in range(1, num_epochs + 1):
@@ -356,14 +361,16 @@ def run(args):
             generate(model, grapher, 'student') # generate student samples
             generate(model, grapher, 'teacher') # generate teacher samples
 
-        # evaluate one-time metrics
-        append_to_csv([test_loss], "{}_test_elbo.csv".format(args.uid))
+        # evaluate and save away one-time metrics
+        check_or_create_dir(os.path.join(args.output_dir))
+        append_to_csv([test_loss], os.path.join(args.output_dir, "{}_test_elbo.csv".format(args.uid)))
         append_to_csv(calculate_consistency(model, loader, args.reparam_type, args.vae_type, args.cuda),
-                      "{}_consistency.csv".format(args.uid))
+                      os.path.join(args.output_dir, "{}_consistency.csv".format(args.uid)))
         grapher.vis.text(pprint.PrettyPrinter(indent=4).pformat(model.student.config),
                          opts=dict(title="config"))
 
         if args.calculate_fid_with is not None:
+            # TODO: parameterize num fid samples, currently use less for inceptionv3 as it's COSTLY
             num_fid_samples = 4000 if args.calculate_fid_with != 'inceptionv3' else 1000
             append_to_csv(calculate_fid(fid_model=fid_model,
                                         model=model,
@@ -372,6 +379,7 @@ def run(args):
                                         cuda=args.cuda),
                           "{}_fid.csv".format(args.uid))
 
+        grapher.save() # save the remote visdom graphs
         if j != len(data_loaders) - 1:
             # spawn a new student & rebuild grapher; we also pass
             # the new model's parameters through a new optimizer.
@@ -382,14 +390,15 @@ def run(args):
                 print("there are {} params in the st-model and {} params in the student".format(
                     len(list(model.parameters())), len(list(model.student.parameters()))))
 
-            grapher.save() # save to json after distributional interval
             grapher = Grapher(env=model.get_name(),
                               server=args.visdom_url,
                               port=args.visdom_port)
 
             if args.ewc:
                 # calculate the fisher from the previous data loader
-                fisher = estimate_fisher(model, loader, args.batch_size, cuda=args.cuda) if args.ewc else None
+                fisher = estimate_fisher(model.teacher,
+                                         loader, args.batch_size,
+                                         cuda=args.cuda)
 
 
 if __name__ == "__main__":

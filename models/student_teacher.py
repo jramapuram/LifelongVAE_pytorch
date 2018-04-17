@@ -162,18 +162,18 @@ class StudentTeacher(nn.Module):
 
         return vae_loss
 
-    def _ewc(self, fisher_matrix, gamma=30):
+    def _ewc(self, fisher_matrix):
         losses = []
         for (nt, pt), (ns, ps), (nf, fish) in zip(self.teacher.named_parameters(),
                                                   self.student.named_parameters(),
                                                   fisher_matrix.items()):
             # print("f {} * (t {} - s {})".format(nf, nt, ns))
             # print("f {} * (t {} - s {})".format(fish.size(), pt.size(), ps.size()))
-            # print("f {} * (t {} - s {})".format(type(fish), type(pt), type(ps)))
+            # print("f {} * (t {} - s {})".format(fish.type(), pt.type(), ps.type()))
             if pt.size() == ps.size():
-                losses.append(torch.sum(fish * (pt - ps)**2))
+                losses.append(torch.sum(fish * (ps - pt)**2))
 
-        return (gamma / 2.0) * sum(losses)
+        return (self.config['ewc_gamma'] / 2.0) * sum(losses)
 
 
     def _ewc_loss_function(self, output_map, fisher_matrix):

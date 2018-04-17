@@ -105,7 +105,7 @@ class ParallellyReparameterizedVAE(AbstractVAE):
 
     def kld(self, dist_a):
         ''' KL divergence between dist_a and prior '''
-        return torch.sum(self.reparameterizer.kl(dist_a), dim=-1)
+        return self.reparameterizer.kl(dist_a)
 
     def mut_info(self, dist_params):
         ''' helper to get mutual info '''

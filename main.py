@@ -385,6 +385,8 @@ def run(args):
             # the new model's parameters through a new optimizer.
             if not args.disable_student_teacher:
                 model.fork()
+                global TOTAL_ITER
+                TOTAL_ITER = 0
                 lazy_generate_modules(model, data_loaders[0].img_shp)
                 optimizer = build_optimizer(model.student)
                 print("there are {} params in the st-model and {} params in the student".format(

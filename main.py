@@ -377,7 +377,7 @@ def run(args):
                                         loader=loader, grapher=grapher,
                                         num_samples=num_fid_samples,
                                         cuda=args.cuda),
-                          "{}_fid.csv".format(args.uid))
+                          os.path.join(args.output_dir, "{}_fid.csv".format(args.uid)))
 
         grapher.save() # save the remote visdom graphs
         if j != len(data_loaders) - 1:

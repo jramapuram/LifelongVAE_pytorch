@@ -310,7 +310,7 @@ def lazy_generate_modules(model, img_shp):
 
 def test_and_generate(epoch, model, fisher, loader, grapher):
     test_loss = test(epoch=epoch, model=model,
-                     fisher=fisher, data_loader=loader.test_loader,
+                     fisher=fisher, loader=loader.test_loader,
                      grapher=grapher, prefix='test')
     generate(model, grapher, 'student') # generate student samples
     generate(model, grapher, 'teacher') # generate teacher samples

@@ -234,7 +234,8 @@ def execute_graph(epoch, model, fisher, data_loader, grapher, optimizer=None, pr
     grapher.show()
 
     # return this for early stopping
-    loss_val = loss_map['loss_mean'].detach().item()
+    loss_val = {'loss_mean': loss_map['loss_mean'].detach().item(),
+                'elbo_mean': loss_map['elbo_mean'].detach().item()}
     loss_map.clear()
     params.clear()
     return loss_val
@@ -344,11 +345,11 @@ def run(args):
         print("training current distribution for {} epochs".format(num_epochs))
         early = EarlyStopping(model, max_steps=50, burn_in_interval=100) if args.early_stop else None
 
-        test_loss = 0.
+        test_loss = None
         for epoch in range(1, num_epochs + 1):
             train(epoch, model, fisher, optimizer, loader.train_loader, grapher)
             test_loss = test(epoch, model, fisher, loader.test_loader, grapher)
-            if args.early_stop and early(test_loss):
+            if args.early_stop and early(test_loss['loss_mean']):
                 early.restore() # restore and test+generate again
                 test_loss = test_and_generate(epoch, model, fisher, loader, grapher)
                 break
@@ -358,7 +359,7 @@ def run(args):
 
         # evaluate and save away one-time metrics
         check_or_create_dir(os.path.join(args.output_dir))
-        append_to_csv([test_loss], os.path.join(args.output_dir, "{}_test_elbo.csv".format(args.uid)))
+        append_to_csv([test_loss['elbo_mean']], os.path.join(args.output_dir, "{}_test_elbo.csv".format(args.uid)))
         append_to_csv(calculate_consistency(model, loader, args.reparam_type, args.vae_type, args.cuda),
                       os.path.join(args.output_dir, "{}_consistency.csv".format(args.uid)))
         grapher.vis.text(pprint.PrettyPrinter(indent=4).pformat(model.student.config),
@@ -386,6 +387,10 @@ def run(args):
                 optimizer = build_optimizer(model.student)
                 print("there are {} params in the st-model and {} params in the student".format(
                     len(list(model.parameters())), len(list(model.student.parameters()))))
+            else:
+                # increment anyway for vanilla models
+                # so that we can have a separate visdom env
+                model.current_model += 1
 
             grapher = Grapher(env=model.get_name(),
                               server=args.visdom_url,
@@ -393,9 +398,10 @@ def run(args):
 
             if args.ewc:
                 # calculate the fisher from the previous data loader
-                fisher = estimate_fisher(model.teacher,
-                                         loader, args.batch_size,
-                                         cuda=args.cuda)
+                fisher_tmp = estimate_fisher(model.teacher,
+                                             loader, args.batch_size,
+                                             cuda=args.cuda)
+                fisher = fisher_tmp if fisher is None else fisher + fisher_tmp
 
 
 if __name__ == "__main__":

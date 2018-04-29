@@ -76,8 +76,8 @@ class StudentTeacher(nn.Module):
 
     def load(self):
         # load the model if it exists
-        if os.path.isdir(".models"):
-            model_filename = os.path.join(".models", self.get_name() + ".th")
+        if os.path.isdir(self.config['model_dir']):
+            model_filename = os.path.join(self.config['model_dir'], self.get_name() + ".th")
             if os.path.isfile(model_filename):
                 print("loading existing student-teacher model")
                 lazy_generate_modules(self, self.student.input_shape,
@@ -90,8 +90,8 @@ class StudentTeacher(nn.Module):
 
     def save(self, overwrite=False):
         # save the model if it doesnt exist
-        check_or_create_dir(".models")
-        model_filename = os.path.join(".models", self.get_name() + ".th")
+        check_or_create_dir(self.config['model_dir'])
+        model_filename = os.path.join(self.config['model_dir'], self.get_name() + ".th")
         if not os.path.isfile(model_filename) or overwrite:
             print("saving existing student-teacher model")
             torch.save(self.state_dict(), model_filename)

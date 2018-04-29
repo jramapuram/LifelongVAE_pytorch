@@ -39,6 +39,8 @@ parser.add_argument('--data-dir', type=str, default='./.datasets', metavar='DD',
                     help='directory which contains input data')
 parser.add_argument('--output-dir', type=str, default='./experiments', metavar='OD',
                     help='directory which contains csv results')
+parser.add_argument('--model-dir', type=str, default='.models', metavar='MD',
+                    help='directory which contains trained models')
 parser.add_argument('--calculate-fid-with', type=str, default=None,
                     help='enables FID calc & uses model conv/inceptionv3  (default: None)')
 parser.add_argument('--early-stop', action='store_true',

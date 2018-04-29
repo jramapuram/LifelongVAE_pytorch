@@ -11,7 +11,7 @@ from models.relational_network import RelationalNetwork
 from helpers.layers import View, flatten_layers, \
     build_conv_encoder, build_dense_encoder, \
     build_relational_conv_encoder, build_conv_decoder, \
-    build_dense_decoder
+    build_dense_decoder, build_pixelcnn_decoder
 from helpers.distributions import nll_activation as nll_activation_fn
 from helpers.distributions import nll as nll_fn
 
@@ -113,10 +113,13 @@ class AbstractVAE(nn.Module):
     def build_decoder(self):
         ''' helper function to build convolutional or dense decoder'''
         if self.config['layer_type'] == 'conv':
-            decoder = build_conv_decoder(input_size=self.reparameterizer.output_size,
-                                         output_shape=self.input_shape,
-                                         filter_depth=self.config['filter_depth'],
-                                         activation_fn=self.activation_fn)
+            decoder = nn.Sequential(
+                build_conv_decoder(input_size=self.reparameterizer.output_size,
+                                   output_shape=self.input_shape,
+                                   filter_depth=self.config['filter_depth'],
+                                   activation_fn=self.activation_fn)#,
+                #build_pixelcnn_decoder(input_size=1, output_shape=self.input_shape)
+            )
         elif self.config['layer_type'] == 'dense':
             decoder = build_dense_decoder(input_size=self.reparameterizer.output_size,
                                           output_shape=self.input_shape,

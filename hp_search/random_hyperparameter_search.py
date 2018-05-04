@@ -19,9 +19,9 @@ args = parser.parse_args()
 
 def get_rand_hyperparameters():
     return {
-        'batch-size': 300,          # TODO: randomize to test these
+        'batch-size': 100,          # TODO: randomize to test these
         'reparam-type': 'mixture',  # TODO: randomize to test these
-        'epochs': 400,
+        'epochs': 500,
         'layer-type': 'conv',       # TODO: randomize to test these
         'task': 'mnist',
         'visdom-url': 'http://neuralnetworkart.com',
@@ -56,12 +56,12 @@ srun {}""".format(
         run_str
 )
 
-def format_task_str(hp, task_num):
-    return """cd .. && /home/ramapur0/.venv3/bin/python main.py --batch-size={} --model-dir=.nonfidmodels
+def format_task_str(hp):
+    return """/home/ramapur0/.venv3/bin/python ../main.py --batch-size={} --model-dir=.nonfidmodels
     --reparam-type={} --discrete-size={} --continuous-size={} --epochs={} --layer-type={}
-    --ngpu=1 --optimizer={} --mut-reg={} --task fashion --uid={}
-    --calculate-fid-with=inceptionv3 --visdom-url={} --use-pixel-cnn-decoder={}
-    --monte-carlo-infogain={} --continuous-mut-info={} --consistency-gamma={}
+    --ngpu=1 --optimizer={} --mut-reg={} --task mnist --uid={}
+    --calculate-fid-with=inceptionv3 --visdom-url={} {}
+    {} --continuous-mut-info={} --consistency-gamma={}
     --mut-clamp-strategy={} --visdom-port={} --early-stop""".format(
         hp['batch-size'],
         hp['reparam-type'],
@@ -71,10 +71,10 @@ def format_task_str(hp, task_num):
         hp['layer-type'],
         hp['optimizer'],
         hp['mut-reg'],
-        "fasion_hp_search{}".format(task_num),
+        "mnist_hp_search{}",
         hp['visdom-url'],
-        hp['use-pixel-cnn-decoder'],
-        hp['monte-carlo-infogain'],
+        "--use-pixel-cnn-decoder" if hp['use-pixel-cnn-decoder'] else "",
+        "--monte-carlo-infogain" if hp['monte-carlo-infogain'] else "",
         hp['continuous-mut-info'],
         hp['consistency-gamma'],
         hp['mut-clamp-strategy'],
@@ -86,12 +86,18 @@ def get_job_map(idx, gpu_type):
         'partition': 'shared-gpu',
         'time': '12:00:00',
         'gpu': gpu_type,
-        'job-name': "fasion_hp_search{}".format(idx)
+        'job-name': "mnist_hp_search{}".format(idx)
     }
 
 def run(args):
-    # grab some random HP's
+    # grab some random HP's and filter dupes
     hps = [get_rand_hyperparameters() for _ in range(args.num_trials)]
+
+    # create multiple task strings
+    task_strs = [format_task_str(hp) for hp in hps]
+    print("#tasks = ", len(task_strs),  " | #set(task_strs) = ", len(set(task_strs)))
+    task_strs = set(task_strs) # remove dupes
+    task_strs = [ts.format(i) for i, ts in enumerate(task_strs)]
 
     # create GPU array and tile to the number of jobs
     gpu_arr = []
@@ -104,24 +110,21 @@ def run(args):
     num_tiles = int(np.ceil(float(args.num_trials) / len(gpu_arr)))
     gpu_arr = [gpu_arr for _ in range(num_tiles)]
     gpu_arr = [item for sublist in gpu_arr for item in sublist]
-    gpu_arr = gpu_arr[0:args.num_trials]
-
-    # create multiple task strings
-    task_strs = [format_task_str(hp, i) for i, hp in enumerate(hps)]
+    gpu_arr = gpu_arr[0:len(task_strs)]
 
     # create the job maps
     job_maps = [get_job_map(i, gpu_type) for i, gpu_type in enumerate(gpu_arr)]
 
     # sanity check
-    assert len(task_strs) == len(job_maps) == len(hps), "#tasks = {} | #jobs = {} | #hps = {}".format(
-        len(task_strs), len(job_maps), len(hps)
+    assert len(task_strs) == len(job_maps) == len(gpu_arr), "#tasks = {} | #jobs = {} | #gpu_arr = {}".format(
+        len(task_strs), len(job_maps), len(gpu_arr)
     )
 
     # finally get all the required job strings
     job_strs = [format_job_str(jm, ts) for jm, ts in zip(job_maps, task_strs)]
 
     # spawn the jobs!
-    for i, js in enumerate(job_strs):
+    for i, js in enumerate(set(job_strs)):
         print(js + "\n")
         job_name = "hp_search_{}.sh".format(i)
         with open(job_name, 'w') as f:

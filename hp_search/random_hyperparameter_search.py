@@ -19,22 +19,28 @@ args = parser.parse_args()
 
 def get_rand_hyperparameters():
     return {
-        'batch-size': 100,          # TODO: randomize to test these
+        'batch-size': 32,           # TODO: randomize to test these
         'reparam-type': 'mixture',  # TODO: randomize to test these
-        'epochs': 500,
         'layer-type': 'conv',       # TODO: randomize to test these
-        'task': 'mnist',
-        'visdom-url': 'http://neuralnetworkart.com',
-        'visdom-port': 8099,
+        'epochs': 500,                               # FIXED, but uses ES
+        'calculate-fid-with': 'inceptionv3',         # FIXED
+        'task': 'fashion',                            # FIXED
+        'visdom-url': 'http://neuralnetworkart.com', # FIXED
+        'visdom-port': 8104,                         # FIXED
+        'shuffle-minibatches': np.random.choice([1, 0]),
         'discrete-size': np.random.choice([1, 3, 5, 10]),
-        'continuous-size': np.random.choice([10, 20, 30, 40]),
+        'continuous-size': np.random.choice([6, 8, 10, 20, 30, 40]),
         'optimizer': np.random.choice(['adam', 'rmsprop', 'adamnorm']),
-        'mut-reg': np.random.choice([1e-3, 1e-2, 0.1, 0.3, 0.5, 0.7, 1.0, 3.0]),
+        'continuous-mut-info': np.random.choice([1e-3, 1e-2, 0.1, 0.3, 0.5, 0.7, 1.0, 3.0, 5.0, 10.0]),
+        'discrete-mut-info': np.random.choice([1e-3, 1e-2, 0.1, 0.3, 0.5, 0.7, 1.0, 3.0, 5.0, 10.0]),
         'use-pixel-cnn-decoder': np.random.choice([1, 0]),
         'monte-carlo-infogain': np.random.choice([1, 0]),
-        'continuous-mut-info': np.random.choice([1e-4, 1e-3, 1e-2, 0.1, 0.3, 0.5, 0.7, 0.0, 1.0]),
         'consistency-gamma': np.random.choice([0.1, 0.5, 1.0, 3.0, 5.0, 10.0, 100.0]),
-        'mut-clamp-strategy': np.random.choice(['norm', 'clamp', 'none'])
+        'kl-reg': np.random.choice([1.0, 1.1, 1.2, 1.3, 2.0, 3.0]),
+        'likelihood-gamma': np.random.choice([0.0, 0.0, 0.0, 1.0, 0.5, 0.2, 1.2, 1.5, 2.0]),
+        'generative-scale-var': np.random.choice([1.0, 1.01, 1.02, 1.03, 1.04, 1.05, 1.1]),
+        'mut-clamp-strategy': np.random.choice(['norm']), #TODO: randomize and test against clamp
+        'mut-clamp-value': np.random.choice([1, 2, 5, 10, 30, 50, 100])
     }
 
 def format_job_str(job_map, run_str):
@@ -56,29 +62,29 @@ srun {}""".format(
         run_str
 )
 
+def unroll_hp_and_value(hpmap):
+    base_str = ""
+    no_value_keys = ["shuffle-minibatches", "use-pixel-cnn-decoder", "monte-carlo-infogain"]
+    for k, v in hpmap.items():
+        if k in no_value_keys and v == 0:
+            continue
+        elif k in no_value_keys:
+            base_str += " --{}".format(k)
+            continue
+
+        if k == "mut-clamp-value" and hpmap['mut-clamp-strategy'] != 'clamp':
+            continue
+
+        base_str += " --{}={}".format(k, v)
+
+    return base_str
+
 def format_task_str(hp):
-    return """/home/ramapur0/.venv3/bin/python ../main.py --batch-size={} --model-dir=.nonfidmodels
-    --reparam-type={} --discrete-size={} --continuous-size={} --epochs={} --layer-type={}
-    --ngpu=1 --optimizer={} --mut-reg={} --task mnist --uid={}
-    --calculate-fid-with=inceptionv3 --visdom-url={} {}
-    {} --continuous-mut-info={} --consistency-gamma={}
-    --mut-clamp-strategy={} --visdom-port={} --early-stop""".format(
-        hp['batch-size'],
-        hp['reparam-type'],
-        hp['discrete-size'],
-        hp['continuous-size'],
-        hp['epochs'],
-        hp['layer-type'],
-        hp['optimizer'],
-        hp['mut-reg'],
-        "mnist_hp_search{}",
-        hp['visdom-url'],
-        "--use-pixel-cnn-decoder" if hp['use-pixel-cnn-decoder'] else "",
-        "--monte-carlo-infogain" if hp['monte-carlo-infogain'] else "",
-        hp['continuous-mut-info'],
-        hp['consistency-gamma'],
-        hp['mut-clamp-strategy'],
-        hp['visdom-port'],
+    hpmap_str = unroll_hp_and_value(hp)
+    return """/home/ramapur0/.venv3/bin/python ../main.py --model-dir=.nonfidmodels
+    --early-stop {} --uid={}""".format(
+        hpmap_str,
+        "{}".format(hp['task']) + "_hp_search{}_"
     ).replace("\n", " ").replace("\r", "").replace("   ", " ").replace("  ", " ").strip()
 
 def get_job_map(idx, gpu_type):
@@ -86,7 +92,7 @@ def get_job_map(idx, gpu_type):
         'partition': 'shared-gpu',
         'time': '12:00:00',
         'gpu': gpu_type,
-        'job-name': "mnist_hp_search{}".format(idx)
+        'job-name': "hp_search{}".format(idx)
     }
 
 def run(args):

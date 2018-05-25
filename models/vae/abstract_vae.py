@@ -8,21 +8,18 @@ from collections import OrderedDict, Counter
 
 from helpers.utils import float_type
 from models.relational_network import RelationalNetwork
-from helpers.layers import View, flatten_layers, \
-    build_conv_encoder, build_dense_encoder, \
-    build_relational_conv_encoder, build_conv_decoder, \
-    build_dense_decoder, build_pixelcnn_decoder
+from helpers.layers import View, flatten_layers, Identity, \
+    build_gated_conv_encoder, build_conv_encoder, build_dense_encoder, build_relational_conv_encoder, \
+    build_gated_conv_decoder, build_conv_decoder, build_dense_decoder, build_pixelcnn_decoder, str_to_activ_module
 from helpers.distributions import nll_activation as nll_activation_fn
 from helpers.distributions import nll as nll_fn
 
 
 class AbstractVAE(nn.Module):
     ''' abstract base class for VAE, both sequentialVAE and parallelVAE inherit this '''
-    def __init__(self, input_shape, activation_fn=nn.ELU, num_current_model=0, **kwargs):
+    def __init__(self, input_shape, **kwargs):
         super(AbstractVAE, self).__init__()
         self.input_shape = input_shape
-        self.num_current_model = num_current_model
-        self.activation_fn = activation_fn
         self.is_color = input_shape[0] > 1
         self.chans = 3 if self.is_color else 1
 
@@ -31,6 +28,9 @@ class AbstractVAE(nn.Module):
         pp = pprint.PrettyPrinter(indent=4)
         pp.pprint(self.config)
 
+        # grab the activation nn.Module from the string
+        self.activation_fn = str_to_activ_module(self.config['activation'])
+
         # placeholder in order to sequentialize model
         self.full_model = None
 
@@ -38,17 +38,25 @@ class AbstractVAE(nn.Module):
         ''' helper to get the name of the model '''
         es_str = "es" + str(int(self.config['early_stop'])) if self.config['early_stop'] \
                  else "epochs" + str(self.config['epochs'])
-        full_hash_str = "_{}_{}act{}_da{}_st{}_ewc{}_dr{}_input{}_batch{}_mut{}_filter{}_nll{}_lr{}_{}_ngpu{}".format(
+        full_hash_str = "_{}_{}act{}_da{}_st{}{}_dr{}_re{}_pd{}_klr{}_gsv{}_mcig{}_mcs{}{}_input{}_batch{}_mut{}d{}c_filter{}_nll{}_lr{}_{}_ngpu{}".format(
             str(self.config['layer_type']),
             reparam_str,
             str(self.activation_fn.__name__),
             str(int(self.config['disable_augmentation'])),
             str(int(not self.config['disable_student_teacher'])),
-            str(int(self.config['ewc'])),
+            "_ewc{}".format(str(int(self.config['ewc_gamma']))) if int(self.config['ewc_gamma'] > 0) else "",
             str(int(self.config['disable_regularizers'])),
+            str(int(self.config['use_relational_encoder'])),
+            str(int(self.config['use_pixel_cnn_decoder'])),
+            str(self.config['kl_reg']),
+            str(self.config['generative_scale_var']),
+            str(int(self.config['monte_carlo_infogain'])),
+            str(self.config['mut_clamp_strategy']),
+            "{}".format(str(self.config['mut_clamp_value'])) if self.config['mut_clamp_strategy'] == 'clamp' else "",
             str(self.input_shape),
             str(self.config['batch_size']),
-            str(self.config['mut_reg']),
+            str(self.config['discrete_mut_info']),
+            str(self.config['continuous_mut_info']),
             str(self.config['filter_depth']),
             str(self.config['nll_type']),
             str(self.config['lr']),
@@ -67,6 +75,7 @@ class AbstractVAE(nn.Module):
                                                      .replace('\'', '')
         task_cleaned = AbstractVAE._clean_task_str(self.config['task'])
         return task_cleaned + full_hash_str
+
 
     @staticmethod
     def _clean_task_str(task_str):
@@ -89,16 +98,21 @@ class AbstractVAE(nn.Module):
                 encoder = build_relational_conv_encoder(input_shape=self.input_shape,
                                                         filter_depth=self.config['filter_depth'],
                                                         activation_fn=self.activation_fn)
+                raise NotImplementedError
             else:
-                encoder = build_conv_encoder(input_shape=self.input_shape,
-                                             output_size=self.reparameterizer.input_size,
-                                             filter_depth=self.config['filter_depth'],
-                                             activation_fn=self.activation_fn)
+                conv_builder = build_gated_conv_encoder \
+                           if self.config['disable_gated_conv'] is False else build_conv_encoder
+                encoder = conv_builder(input_shape=self.input_shape,
+                                       output_size=self.reparameterizer.input_size,
+                                       filter_depth=self.config['filter_depth'],
+                                       activation_fn=self.activation_fn,
+                                       normalization_str=self.config['normalization'])
         elif self.config['layer_type'] == 'dense':
             encoder = build_dense_encoder(input_shape=self.input_shape,
                                           output_size=self.reparameterizer.input_size,
                                           latent_size=512,
-                                          activation_fn=self.activation_fn)
+                                          activation_fn=self.activation_fn,
+                                          normalization_str=self.config['normalization'])
         else:
             raise Exception("unknown layer type requested")
 
@@ -113,17 +127,29 @@ class AbstractVAE(nn.Module):
     def build_decoder(self):
         ''' helper function to build convolutional or dense decoder'''
         if self.config['layer_type'] == 'conv':
+            conv_builder = build_gated_conv_decoder \
+                           if self.config['disable_gated_conv'] is False else build_conv_decoder
             decoder = nn.Sequential(
-                build_conv_decoder(input_size=self.reparameterizer.output_size,
-                                   output_shape=self.input_shape,
-                                   filter_depth=self.config['filter_depth'],
-                                   activation_fn=self.activation_fn)#,
-                #build_pixelcnn_decoder(input_size=1, output_shape=self.input_shape)
+                conv_builder(input_size=self.reparameterizer.output_size,
+                             output_shape=self.input_shape,
+                             filter_depth=self.config['filter_depth'],
+                             activation_fn=self.activation_fn,
+                             normalization_str=self.config['normalization'])
             )
+            if self.config['use_pixel_cnn_decoder']:
+                print("adding pixel CNN decoder...")
+                decoder = nn.Sequential(
+                    decoder,
+                    build_pixelcnn_decoder(input_size=self.chans,
+                                           output_shape=self.input_shape,
+                                           normalization_str=self.config['normalization'])
+                )
+
         elif self.config['layer_type'] == 'dense':
             decoder = build_dense_decoder(input_size=self.reparameterizer.output_size,
                                           output_shape=self.input_shape,
-                                          activation_fn=self.activation_fn)
+                                          activation_fn=self.activation_fn,
+                                          normalization_str=self.config['normalization'])
         else:
             raise Exception("unknown layer type requested")
 
@@ -180,7 +206,7 @@ class AbstractVAE(nn.Module):
             if not hasattr(self, 'decoder_projector'):
                 if self.config['layer_type'] == 'conv':
                     self.decoder_projector = nn.Sequential(
-                        nn.BatchNorm2d(self.chans),
+                        nn.BatchNorm2d(self.chans) if not self.config['disable_batchnorm'] else Identity(),
                         self.activation_fn(inplace=True),
                         nn.ConvTranspose2d(self.chans, self.chans*2, 1, stride=1, bias=False)
                     )
@@ -188,7 +214,7 @@ class AbstractVAE(nn.Module):
                     input_flat = int(np.prod(self.input_shape))
                     self.decoder_projector = nn.Sequential(
                         View([-1, input_flat]),
-                        nn.BatchNorm1d(input_flat),
+                        nn.BatchNorm1d(input_flat) if not self.config['disable_batchnorm'] else Identity(),
                         self.activation_fn(inplace=True),
                         nn.Linear(input_flat, input_flat*2, bias=True),
                         View([-1, self.chans*2, *self.input_shape[1:]])
@@ -221,7 +247,7 @@ class AbstractVAE(nn.Module):
         # tf: elbo = -log_likelihood + latent_kl
         # tf: cost = elbo + consistency_kl - self.mutual_info_reg * mutual_info_regularizer
         nll = nll_fn(x, recon_x, self.config['nll_type'])
-        kld = self.kld(params)
+        kld = self.config['kl_reg'] * self.kld(params)
         elbo = nll + kld
 
         # handle the mutual information term
@@ -230,10 +256,15 @@ class AbstractVAE(nn.Module):
                 float_type(self.config['cuda'])(x.size(0)).zero_()
             )
         else:
-            # Clamping strategies: 2 and 3 are about the same [empirically in ELBO]
-            # mut_info = self.config['mut_reg'] * torch.clamp(mut_info, min=0, max=torch.norm(kld, p=2).data[0])
-            # mut_info = self.config['mut_reg'] * mut_info
-            mut_info = self.config['mut_reg'] * (mut_info / torch.norm(mut_info, p=2))
+            # Clamping strategies
+            mut_clamp_strategy_map = {
+                'none': lambda mut_info: mut_info,
+                'norm': lambda mut_info: mut_info / torch.norm(mut_info, p=2),
+                'clamp': lambda mut_info: torch.clamp(mut_info,
+                                                      min=-self.config['mut_clamp_value'],
+                                                      max=self.config['mut_clamp_value'])
+            }
+            mut_info = mut_clamp_strategy_map[self.config['mut_clamp_strategy'].strip().lower()](mut_info)
 
         loss = elbo - mut_info
         return {

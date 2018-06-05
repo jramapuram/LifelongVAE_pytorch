@@ -8,8 +8,9 @@ import torch.distributions as D
 from torch.autograd import Variable
 from copy import deepcopy
 
+from helpers.distributions import nll
 from helpers.utils import expand_dims, long_type, squeeze_expand_dim, \
-    ones_like, float_type, pad, invert_shuffle, one_hot_np, \
+    ones_like, float_type, pad, inv_perm, one_hot_np, \
     zero_pad_smaller_cat, check_or_create_dir
 from models.vae.parallelly_reparameterized_vae import ParallellyReparameterizedVAE
 from models.vae.sequentially_reparameterized_vae import SequentiallyReparameterizedVAE
@@ -25,9 +26,11 @@ def detach_from_graph(param_map):
 
 def kl_categorical_categorical(dist_a, dist_b, rnd_perm, from_index=0):
     # invert the shuffle for the KL calculation
-    # dist_a_logits = invert_shuffle(dist_a['logits'], rnd_perm) # undo the random perm
-    # dist_b_logits = invert_shuffle(dist_b['logits'], rnd_perm) # undo the random perm
-    dist_a_logits, dist_b_logits = dist_a['logits'], dist_b['logits']
+    if rnd_perm is not None:
+        dist_a_logits, dist_b_logits = [inv_perm(dist_a['logits'], rnd_perm),
+                                        inv_perm(dist_b['logits'], rnd_perm)]
+    else:
+        dist_a_logits, dist_b_logits = dist_a['logits'], dist_b['logits']
 
     # https://github.com/tensorflow/tensorflow/blob/r1.1/tensorflow/contrib/distributions/python/ops/categorical.py
     dist_a_log_softmax = F.log_softmax(dist_a_logits[from_index:], dim=-1)
@@ -46,9 +49,18 @@ def kl_categorical_categorical(dist_a, dist_b, rnd_perm, from_index=0):
     return torch.sum(dist_a_softmax * delta_log_probs1, dim=-1)
 
 
-def kl_isotropic_gauss_gauss(dist_a, dist_b, rnd_perm=None):
-    n0 = D.Normal(dist_a['mu'], dist_a['logvar'])
-    n1 = D.Normal(dist_b['mu'], dist_b['logvar'])
+def kl_isotropic_gauss_gauss(dist_a, dist_b, rnd_perm, from_index=0):
+    if rnd_perm is not None:
+        mu0, logvar0 = [inv_perm(dist_a['mu'], rnd_perm)[from_index:],
+                        inv_perm(dist_a['logvar'], rnd_perm)[from_index:]]
+        mu1, logvar1 = [inv_perm(dist_b['mu'], rnd_perm)[from_index:],
+                        inv_perm(dist_b['logvar'], rnd_perm)[from_index:]]
+    else:
+         mu0, logvar0 = dist_a['mu'][from_index:], dist_a['logvar'][from_index:]
+         mu1, logvar1 = dist_b['mu'][from_index:], dist_b['logvar'][from_index:]
+
+    n0 = D.Normal(mu0, logvar0)
+    n1 = D.Normal(mu1, logvar1)
     return torch.sum(D.kl_divergence(n0, n1), dim=-1)
 
 
@@ -76,30 +88,36 @@ class StudentTeacher(nn.Module):
 
     def load(self):
         # load the model if it exists
-        if os.path.isdir(".models"):
-            model_filename = os.path.join(".models", self.get_name() + ".th")
+        if os.path.isdir(self.config['model_dir']):
+            model_filename = os.path.join(self.config['model_dir'], self.get_name() + ".th")
             if os.path.isfile(model_filename):
-                print("loading existing student-teacher model")
+                print("loading existing student-teacher model: {}".format(model_filename))
                 lazy_generate_modules(self, self.student.input_shape,
                                       self.config['batch_size'],
                                       self.config['cuda'])
-                self.load_state_dict(torch.load(model_filename))
+                self.load_state_dict(torch.load(model_filename), strict=True)
                 return True
+            else:
+                print("{} does not exist...".format(model_filename))
 
         return False
 
     def save(self, overwrite=False):
         # save the model if it doesnt exist
-        check_or_create_dir(".models")
-        model_filename = os.path.join(".models", self.get_name() + ".th")
+        check_or_create_dir(self.config['model_dir'])
+        model_filename = os.path.join(self.config['model_dir'], self.get_name() + ".th")
         if not os.path.isfile(model_filename) or overwrite:
-            print("saving existing student-teacher model")
+            print("saving existing student-teacher model...")
             torch.save(self.state_dict(), model_filename)
 
     def get_name(self):
-        #teacher_name = "teacher_" + self.teacher.get_name() if self.teacher else "teacher_none"
-        #return teacher_name + "student_" + self.student.get_name()
-        return str(self.config['uid']) + str(self.current_model) + self.student.get_name()
+        return "{}{}_cg{}_s{}{}".format(
+            str(self.config['uid']),
+            str(self.current_model),
+            str(self.config['consistency_gamma']),
+            str(int(self.config['shuffle_minibatches'])),
+            self.student.get_name()
+        )
 
     def posterior_regularizer_parallel(self, q_z_given_x_t, q_z_given_x_s):
         ''' Evaluates KL(Q_{\Phi})(z | \hat{x}) || Q_{\phi})(z | \hat{x})) '''
@@ -112,7 +130,9 @@ class StudentTeacher(nn.Module):
         elif 'gaussian' in q_z_given_x_s and 'gaussian' in q_z_given_x_t:
             # gauss kl-kl doesnt have any from-index
             return kl_isotropic_gauss_gauss(q_z_given_x_s['gaussian'],
-                                            q_z_given_x_t['gaussian'])
+                                            q_z_given_x_t['gaussian'],
+                                            self.rnd_perm, from_index=self.num_student_samples)
+            raise Exception("posterior regularizer b/w gaussians not supported")
         else:
             raise NotImplementedError("unknown distribution requested for kl")
 
@@ -141,6 +161,18 @@ class StudentTeacher(nn.Module):
         }
         return posterior_fn_map[self.config['vae_type']](q_z_given_x_t, q_z_given_x_s)
 
+    def likelihood_regularizer(self, p_x_given_z_t_activated, p_x_given_z_s_logits):
+        if self.rnd_perm is not None:
+            p_x_given_z_s_logits = inv_perm(p_x_given_z_s_logits, self.rnd_perm)
+            p_x_given_z_t_activated = inv_perm(p_x_given_z_t_activated, self.rnd_perm)
+
+        img_unrolled = int(np.prod(self.config['img_shp']))
+        p_x_given_z_s_logits = p_x_given_z_s_logits[self.num_student_samples:].view(-1, img_unrolled)
+        p_x_given_z_t_activated = p_x_given_z_t_activated[self.num_student_samples:].view(-1, img_unrolled)
+        # return torch.sum(D.kl_divergence(D.Bernoulli(logits=p_x_given_z_s_logits),
+        #                                  D.Bernoulli(logits=p_x_given_z_s_logits)), -1)
+        return nll(p_x_given_z_t_activated, p_x_given_z_s_logits, self.config['nll_type'])
+
     def _lifelong_loss_function(self, output_map):
         ''' returns a combined loss of the VAE loss
             + regularizers '''
@@ -155,25 +187,46 @@ class StudentTeacher(nn.Module):
                                         diff,
                                         dim=0,
                                         prepend=True)
-            # posterior_regularizer = posterior_regularizer[self.rnd_perm]
-            # posterior_regularizer = invert_shuffle(posterior_regularizer, self.rnd_perm)
-            vae_loss['loss_mean'] = torch.mean(vae_loss['loss'] + posterior_regularizer)
+
+            # add the likelihood regularizer and multiply it by the const
+            likelihood_regularizer = self.likelihood_regularizer(output_map['teacher']['x_reconstr'],
+                                                                 output_map['student']['x_reconstr_logits'])
+            likelihood_regularizer = pad(likelihood_regularizer,
+                                         diff,
+                                         dim=0,
+                                         prepend=True)
+            if self.rnd_perm is not None: # re-shuffle
+                posterior_regularizer = posterior_regularizer[self.rnd_perm]
+                likelihood_regularizer = likelihood_regularizer[self.rnd_perm]
+
+            posterior_regularizer = self.config['consistency_gamma'] * posterior_regularizer
+            likelihood_regularizer = self.config['likelihood_gamma'] * likelihood_regularizer
+            vae_loss['loss_mean'] = torch.mean(vae_loss['loss'] + likelihood_regularizer + posterior_regularizer)
             vae_loss['posterior_regularizer_mean'] = torch.mean(posterior_regularizer)
+            vae_loss['likelihood_regularizer_mean'] = torch.mean(likelihood_regularizer)
 
         return vae_loss
 
-    def _ewc(self, fisher_matrix, gamma=30):
+    def _ewc(self, fisher_matrix):
         losses = []
+        assert len(list(self.teacher.named_parameters())) \
+            == len(list(self.student.named_parameters())) \
+            == len(fisher_matrix), "#student params != #teacher params != #fisher params"
         for (nt, pt), (ns, ps), (nf, fish) in zip(self.teacher.named_parameters(),
                                                   self.student.named_parameters(),
                                                   fisher_matrix.items()):
             # print("f {} * (t {} - s {})".format(nf, nt, ns))
             # print("f {} * (t {} - s {})".format(fish.size(), pt.size(), ps.size()))
-            # print("f {} * (t {} - s {})".format(type(fish), type(pt), type(ps)))
-            if pt.size() == ps.size():
-                losses.append(torch.sum(fish * (pt - ps)**2))
+            # print("f {} * (t {} - s {})".format(fish.type(), pt.type(), ps.type()))
+            if pt.size() != ps.size() != fish.size():
+                raise Exception("""teacher param [{}] does not match student
+                param[{}] does not match fisher info param[{}]""".format(
+                    pt.size(), ps.size(), fish.size()
+                ))
 
-        return (gamma / 2.0) * sum(losses)
+            losses.append(torch.sum(fish * (ps - pt)**2))
+
+        return (self.config['ewc_gamma'] / 2.0) * sum(losses)
 
 
     def _ewc_loss_function(self, output_map, fisher_matrix):
@@ -190,7 +243,7 @@ class StudentTeacher(nn.Module):
 
 
     def loss_function(self, output_map, fisher=None):
-        if self.config['ewc']:
+        if self.config['ewc_gamma'] > 0:
             return self._ewc_loss_function(output_map, fisher)
 
         return self._lifelong_loss_function(output_map)
@@ -223,9 +276,11 @@ class StudentTeacher(nn.Module):
 
     def fork(self):
         # copy the old student into the teacher
+        # dont increase discrete dim for ewc
         config_copy = deepcopy(self.student.config)
-        config_copy['discrete_size'] += 1
+        config_copy['discrete_size'] += 0 if self.config['ewc_gamma'] > 0 else self.config['discrete_size']
         self.teacher = deepcopy(self.student)
+        del self.student
 
         # create a new student
         if self.config['vae_type'] == 'sequential':
@@ -261,8 +316,10 @@ class StudentTeacher(nn.Module):
         print("#teacher_samples: ", num_teacher_samples,
               " | #student_samples: ", num_student_samples)
 
-    def generate_synthetic_samples(self, model, batch_size):
-        z_samples = model.reparameterizer.prior(batch_size)
+    def generate_synthetic_samples(self, model, batch_size, **kwargs):
+        z_samples = model.reparameterizer.prior(
+            batch_size, scale_var=self.config['generative_scale_var'], **kwargs
+        )
         return model.nll_activation(model.generate(z_samples))
 
     def generate_synthetic_sequential_samples(self, model, num_rows=8):
@@ -270,18 +327,15 @@ class StudentTeacher(nn.Module):
 
         # create a grid of one-hot vectors for displaying in visdom
         # uses one row for original dimension of discrete component
-        num_current_discrete = model.reparameterizer.config['discrete_size']
-        num_orig_discrete = num_current_discrete - model.num_current_model
-        discrete_indices = np.asarray([[np.random.randint(0, num_orig_discrete)]
-                                       for _ in range(num_rows)]).reshape(-1, num_rows)
-        if model.num_current_model > 0:
-            extra_discrete_indices = np.asarray([[i]*num_rows for i in range(num_orig_discrete,
-                                                                             num_current_discrete)])
-            discrete_indices = np.vstack([discrete_indices, extra_discrete_indices])
-
+        discrete_indices = np.array([np.random.randint(begin, end, size=num_rows) for begin, end in
+                                     zip(range(0, model.reparameterizer.config['discrete_size'],
+                                               self.config['discrete_size']),
+                                         range(self.config['discrete_size'],
+                                               model.reparameterizer.config['discrete_size'] + 1,
+                                               self.config['discrete_size']))])
         discrete_indices = discrete_indices.reshape(-1)
         with torch.no_grad():
-            z_samples = Variable(torch.from_numpy(one_hot_np(num_current_discrete,
+            z_samples = Variable(torch.from_numpy(one_hot_np(model.reparameterizer.config['discrete_size'],
                                                              discrete_indices)))
             z_samples = z_samples.type(float_type(self.config['cuda']))
 
@@ -308,17 +362,23 @@ class StudentTeacher(nn.Module):
         # workaround for batchnorm on multiple GPUs
         # we shuffle the data and unshuffle it later for
         # the posterior regularizer
-        # self.rnd_perm = torch.randperm(merged.size(0))
-        # if self.config['cuda']:
-        #     self.rnd_perm = self.rnd_perm.cuda()
+        if self.config['shuffle_minibatches']:
+            self.rnd_perm = torch.randperm(merged.size(0))
+            if self.config['cuda']:
+                self.rnd_perm = self.rnd_perm.cuda()
 
-        # return merged[self.rnd_perm]
+            return merged[self.rnd_perm]
+        else:
+            return merged
 
-        return merged
 
     def forward(self, x):
         x_augmented = self._augment_data(x).contiguous()
         x_recon_student, params_student = self.student(x_augmented)
+        x_reconstr_student_activated = self.student.nll_activation(x_recon_student)
+        _, q_z_given_xhat = self.student.posterior(x_reconstr_student_activated)
+        params_student['q_z_given_xhat'] = q_z_given_xhat
+
         ret_map = {
             'student':{
                 'params': params_student,
@@ -336,10 +396,13 @@ class StudentTeacher(nn.Module):
         if self.teacher is not None:
             # only teacher Q(z|x) is needed, so dont run decode step
             self.teacher.eval()
-            _, params_teacher = self.teacher.posterior(x_augmented)
+            #_, params_teacher = self.teacher.posterior(x_augmented)
+            x_recon_teacher, params_teacher = self.teacher(x_augmented)
             # detach_from_graph(params_teacher)
             ret_map['teacher']= {
-                'params': params_teacher
+                'params': params_teacher,
+                'x_reconstr': self.teacher.nll_activation(x_recon_teacher),
+                'x_reconstr_logits': x_recon_teacher
             }
 
         return ret_map

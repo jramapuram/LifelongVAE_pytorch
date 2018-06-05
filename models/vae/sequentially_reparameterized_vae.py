@@ -176,7 +176,7 @@ class SequentiallyReparameterizedVAE(AbstractVAE):
         batch_size = dists['z_0'].size(0)
         kl = Variable(float_type(self.config['cuda'])(batch_size).zero_())
         for i, reparameterizer in enumerate(self.reparameterizers):
-            kl += torch.sum(reparameterizer[-1].kl(dists['params_%d'%i]), dim=-1)
+            kl += reparameterizer[-1].kl(dists['params_%d'%i])
 
         return kl
 

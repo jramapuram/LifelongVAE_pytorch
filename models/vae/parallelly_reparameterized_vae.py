@@ -85,19 +85,20 @@ class ParallellyReparameterizedVAE(AbstractVAE):
         ''' encodes via a convolution
             and lazy init's a dense projector'''
         conv = self.encoder(x)         # do the convolution
+        return conv
 
-        if self.config['use_relational_encoder']:
-            # build a relational net as the encoder projection
-            self._lazy_init_relational(self.reparameterizer.input_size, name='enc_proj')
-        else:
-            # project via linear layer [if necessary!]
-            conv_output_shp = int(np.prod(conv.size()[1:]))
-            self._lazy_init_dense(conv_output_shp,
-                                  self.reparameterizer.input_size,
-                                  name='enc_proj')
+        # if self.config['use_relational_encoder']:
+        #     # build a relational net as the encoder projection
+        #     self._lazy_init_relational(self.reparameterizer.input_size, name='enc_proj')
+        # else:
+        #     # project via linear layer [if necessary!]
+        #     conv_output_shp = int(np.prod(conv.size()[1:]))
+        #     self._lazy_init_dense(conv_output_shp,
+        #                           self.reparameterizer.input_size,
+        #                           name='enc_proj')
 
-        # return projected units
-        return self.enc_proj(conv)
+        # # return projected units
+        # return self.enc_proj(conv)
 
     def generate(self, z):
         ''' reparameterizer for sequential is different '''
@@ -105,13 +106,13 @@ class ParallellyReparameterizedVAE(AbstractVAE):
 
     def kld(self, dist_a):
         ''' KL divergence between dist_a and prior '''
-        return torch.sum(self.reparameterizer.kl(dist_a), dim=-1)
+        return self.reparameterizer.kl(dist_a)
 
     def mut_info(self, dist_params):
         ''' helper to get mutual info '''
         mut_info = None
-        if self.config['reparam_type'] == 'mixture' \
-           or self.config['reparam_type'] == 'discrete'\
+        if (self.config['reparam_type'] == 'mixture' \
+           or self.config['reparam_type'] == 'discrete')\
            and not self.config['disable_regularizers']:
             mut_info = self.reparameterizer.mutual_info(dist_params)
 

@@ -1,4 +1,5 @@
 import os
+import time
 import json
 import argparse
 import numpy as np
@@ -31,8 +32,8 @@ parser.add_argument('--uid', type=str, default="",
 parser.add_argument('--task', type=str, default="mnist",
                     help="""task to work on (can specify multiple) [mnist / cifar10 /
                     fashion / svhn_centered / svhn / clutter / permuted] (default: mnist)""")
-parser.add_argument('--epochs', type=int, default=10, metavar='N',
-                    help='minimum number of epochs to train (default: 10)')
+parser.add_argument('--epochs', type=int, default=500, metavar='N',
+                    help='minimum number of epochs to train (default: 500)')
 parser.add_argument('--continuous-size', type=int, default=32, metavar='L',
                     help='latent size of continuous variable when using mixture or gaussian (default: 32)')
 parser.add_argument('--discrete-size', type=int, default=1,
@@ -65,7 +66,9 @@ parser.add_argument('--filter-depth', type=int, default=32,
                     help='number of initial conv filter maps (default: 32)')
 parser.add_argument('--reparam-type', type=str, default='isotropic_gaussian',
                     help='isotropic_gaussian, discrete or mixture [default: isotropic_gaussian]')
-parser.add_argument('--layer-type', type=str, default='conv',
+parser.add_argument('--encoder-layer-type', type=str, default='conv',
+                    help='dense or conv (default: conv)')
+parser.add_argument('--decoder-layer-type', type=str, default='conv',
                     help='dense or conv (default: conv)')
 parser.add_argument('--nll-type', type=str, default='bernoulli',
                     help='bernoulli or gaussian (default: bernoulli)')
@@ -73,7 +76,9 @@ parser.add_argument('--log-interval', type=int, default=10, metavar='N',
                     help='how many batches to wait before logging training status')
 parser.add_argument('--vae-type', type=str, default='parallel',
                     help='vae type [sequential or parallel] (default: parallel)')
-parser.add_argument('--normalization', type=str, default='groupnorm',
+parser.add_argument('--conv-normalization', type=str, default='groupnorm',
+                    help='normalization type: batchnorm/groupnorm/instancenorm/none (default: groupnorm)')
+parser.add_argument('--dense-normalization', type=str, default='groupnorm',
                     help='normalization type: batchnorm/groupnorm/instancenorm/none (default: groupnorm)')
 parser.add_argument('--activation', type=str, default='elu',
                     help='activation function (default: elu)')
@@ -83,10 +88,8 @@ parser.add_argument('--shuffle-minibatches', action='store_true',
                     help='shuffles the student\'s minibatch (default: False)')
 parser.add_argument('--use-relational-encoder', action='store_true',
                     help='uses a relational network as the encoder projection layer')
-parser.add_argument('--use-pixel-cnn-decoder', action='store_true',
-                    help='uses a pixel CNN decoder (default: False)')
-parser.add_argument('--disable-gated-conv', action='store_true',
-                    help='disables gated convolutional structure (default: False)')
+parser.add_argument('--disable-gated', action='store_true',
+                    help='disables gated convolutional/dense structure (default: False)')
 parser.add_argument('--disable-student-teacher', action='store_true',
                     help='uses a standard VAE without Student-Teacher architecture')
 
@@ -125,12 +128,14 @@ parser.add_argument('--ewc-gamma', type=float, default=0,
                     help='any value greater than 0 enables EWC with this hyper-parameter (default: 0)')
 
 # Visdom parameters
-parser.add_argument('--visdom-url', type=str, default="http://localhost",
-                    help='visdom URL for graphs (default: http://localhost)')
-parser.add_argument('--visdom-port', type=int, default="8097",
-                    help='visdom port for graphs (default: 8097)')
+parser.add_argument('--visdom-url', type=str, default=None,
+                    help='visdom URL for graphs (needs http, eg: http://localhost) (default: None)')
+parser.add_argument('--visdom-port', type=int, default=None,
+                    help='visdom port for graphs (default: None)')
 
 # Device parameters
+parser.add_argument('--half', action='store_true', default=False,
+                    help='enables half precision training')
 parser.add_argument('--seed', type=int, default=None,
                     help='seed for numpy and pytorch (default: None)')
 parser.add_argument('--ngpu', type=int, default=1,
@@ -141,11 +146,13 @@ args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
 
 
-# handle randomness / non-randomness
+# handle non-randomness
 if args.seed is not None:
     print("setting seed %d" % args.seed)
-    numpy.random.seed(args.seed)
-    torch.manual_seed_all(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if args.cuda:
+        torch.cuda.manual_seed_all(args.seed)
 
 
 def build_optimizer(model):
@@ -165,27 +172,30 @@ def build_optimizer(model):
 
 
 def register_plots(loss, grapher, epoch, prefix='train'):
+    ''' helper to register all plots with *_mean and *_scalar '''
     for k, v in loss.items():
         if isinstance(v, map):
             register_plots(loss[k], grapher, epoch, prefix=prefix)
 
         if 'mean' in k or 'scalar' in k:
-            key_name = k.split('_')[0]
+            key_name = '-'.join(k.split('_')[0:-1])
             value = v.item() if not isinstance(v, (float, np.float32, np.float64)) else v
-            grapher.register_single({'%s_%s' % (prefix, key_name): [[epoch], [value]]},
-                                    plot_type='line')
+            grapher.add_scalar('{}_{}'.format(prefix, key_name), value, epoch)
 
 
-def register_images(images, names, grapher, prefix="train"):
-    ''' helper to register a list of images '''
-    if isinstance(images, list):
-        assert len(images) == len(names)
-        for im, name in zip(images, names):
-            register_images(im, name, grapher, prefix=prefix)
-    else:
-        images = torch.min(images.detach(), ones_like(images))
-        grapher.register_single({'{}_{}'.format(prefix, names): images},
-                                plot_type='imgs')
+def register_images(output_map, grapher, prefix='train'):
+    ''' helper to register all plots with *_img and *_imgs
+        NOTE: only registers 1 image to avoid MILLION imgs in visdom,
+              consider adding epoch for tensorboardX though
+    '''
+    for k, v in output_map.items():
+        if isinstance(v, map):
+            register_images(output_map[k], grapher, epoch, prefix=prefix)
+
+        if 'img' in k or 'imgs' in k:
+            key_name = '-'.join(k.split('_')[0:-1])
+            grapher.add_image('{}_{}'.format(prefix, key_name),
+                              v.detach(), global_step=0) # dont use step
 
 
 def _add_loss_map(loss_tm1, loss_t):
@@ -230,6 +240,7 @@ def test(epoch, model, fisher, loader, grapher, prefix='test'):
 
 def execute_graph(epoch, model, fisher, data_loader, grapher, optimizer=None, prefix='test'):
     ''' execute the graph; when 'train' is in the name the model runs the optimizer '''
+    start_time = time.time()
     model.eval() if not 'train' in prefix else model.train()
     assert optimizer is not None if 'train' in prefix else optimizer is None
     loss_map, params, num_samples = {}, {}, 0
@@ -260,8 +271,8 @@ def execute_graph(epoch, model, fisher, data_loader, grapher, optimizer=None, pr
             num_samples += data.size(0)
 
     loss_map = _mean_map(loss_map) # reduce the map to get actual means
-    print('{}[Epoch {}][{} samples]: Average loss: {:.4f}\tELBO: {:.4f}\tKLD: {:.4f}\tNLL: {:.4f}\tMut: {:.4f}'.format(
-        prefix, epoch, num_samples,
+    print('{}[Epoch {}][{} samples][{:.2f} sec]: Average loss: {:.4f}\tELBO: {:.4f}\tKLD: {:.4f}\tNLL: {:.4f}\tMut: {:.4f}'.format(
+        prefix, epoch, num_samples, time.time() - start_time,
         loss_map['loss_mean'].item(),
         loss_map['elbo_mean'].item(),
         loss_map['kld_mean'].item(),
@@ -274,9 +285,11 @@ def execute_graph(epoch, model, fisher, data_loader, grapher, optimizer=None, pr
     # plot the test accuracy, loss and images
     if grapher: # only if grapher is not None
         register_plots({**loss_map, **reparam_scalars}, grapher, epoch=epoch, prefix=prefix)
-        images = [output_map['augmented']['data'], output_map['student']['x_reconstr']]
-        img_names = ['original_imgs', 'vae_reconstructions']
-        register_images(images, img_names, grapher, prefix=prefix)
+        imgs_map = {
+            'original_imgs': output_map['augmented']['data'],
+            'vae_reconstruction_imgs': output_map['student']['x_reconstr']
+        }
+        register_images(imgs_map, grapher, prefix=prefix)
         grapher.show()
 
     # return this for early stopping
@@ -287,7 +300,11 @@ def execute_graph(epoch, model, fisher, data_loader, grapher, optimizer=None, pr
     return loss_val
 
 
-def generate(student_teacher, grapher, name='teacher'):
+def generate(epoch, student_teacher, grapher, name='teacher'):
+    if args.decoder_layer_type == 'pixelcnn' and epoch % 10 != 0:
+        # XXX: don't generate every epoch for pixelcnn
+        return
+
     model = {
         'teacher': student_teacher.teacher,
         'student': student_teacher.student
@@ -295,17 +312,26 @@ def generate(student_teacher, grapher, name='teacher'):
 
     if model[name] is not None: # handle base case
         model[name].eval()
+
         # random generation
-        gen = student_teacher.generate_synthetic_samples(model[name],
-                                                         args.batch_size)
-        gen = torch.min(gen, ones_like(gen))
-        grapher.register_single({'generated_%s'%name: gen}, plot_type='imgs')
+        gen_map = {
+            'samples_%s_imgs' % name: student_teacher.generate_synthetic_samples(
+                model[name],
+                args.batch_size)
+        }
+        # gen_map['samples_%s_imgs' % name] = torch.min(
+        #     gen_map['samples_%s_imgs' % name],
+        #     ones_like(gen_map['samples_%s_imgs' % name]))
 
         # sequential generation for discrete and mixture reparameterizations
         if args.reparam_type == 'mixture' or args.reparam_type == 'discrete':
-            gen = student_teacher.generate_synthetic_sequential_samples(model[name]).detach()
-            gen = torch.min(gen, ones_like(gen))
-            grapher.register_single({'sequential_generated_%s'%name: gen}, plot_type='imgs')
+            gen_map['sequential_samples_%s_imgs'%name] = \
+                student_teacher.generate_synthetic_sequential_samples(model[name]).detach()
+            # gen_map['sequential_samples_%s_imgs'%name] = torch.min(
+            #     gen_map['sequential_samples_%s_imgs'%name],
+            #     ones_like(gen_map['sequential_samples_%s_imgs'%name]))
+
+        register_images(gen_map, grapher, prefix="generated")
 
 
 def get_model_and_loader():
@@ -341,9 +367,13 @@ def get_model_and_loader():
     #student_teacher = init_weights(student_teacher)
 
     # build the grapher object
-    grapher = Grapher(env=student_teacher.get_name(),
-                      server=args.visdom_url,
-                      port=args.visdom_port)
+    if args.visdom_url is not None:
+        grapher = Grapher('visdom',
+                          env=student_teacher.get_name(),
+                          server=args.visdom_url,
+                          port=args.visdom_port)
+    else:
+        grapher = Grapher('tensorboard', comment=student_teacher.get_name())
 
     return [student_teacher, loaders, grapher]
 
@@ -351,16 +381,21 @@ def get_model_and_loader():
 def lazy_generate_modules(model, img_shp):
     ''' Super hax, but needed for building lazy modules '''
     model.eval()
-    data = float_type(args.cuda)(args.batch_size, *img_shp).normal_()
+    #data = float_type(args.cuda)(args.batch_size, *img_shp).normal_()
+    data = float_type(next(model.parameters()).is_cuda)(args.batch_size, *img_shp).normal_()
     model(Variable(data))
+
+    # push toe model to cuda
+    if args.cuda and not next(model.parameters()).is_cuda:
+        model.cuda()
 
 
 def test_and_generate(epoch, model, fisher, loader, grapher):
     test_loss = test(epoch=epoch, model=model,
                      fisher=fisher, loader=loader.test_loader,
                      grapher=grapher, prefix='test')
-    generate(model, grapher, 'student') # generate student samples
-    generate(model, grapher, 'teacher') # generate teacher samples
+    generate(epoch, model, grapher, 'student') # generate student samples
+    generate(epoch, model, grapher, 'teacher') # generate teacher samples
     return test_loss
 
 
@@ -402,8 +437,9 @@ def train_loop(data_loaders, model, fid_model, grapher, args):
     for j, loader in enumerate(data_loaders):
         num_epochs = args.epochs # TODO: randomize epochs by something like: + np.random.randint(0, 13)
         print("training current distribution for {} epochs".format(num_epochs))
-        early = EarlyStopping(model, max_steps=50, burn_in_interval=None) if args.early_stop else None
-                              #burn_in_interval=int(num_epochs*0.2)) if args.early_stop else None
+        early = EarlyStopping(model, max_steps=100,
+                              # burn_in_interval=None) if args.early_stop else None
+                              burn_in_interval=int(num_epochs*0.2)) if args.early_stop else None
 
         test_loss = None
         for epoch in range(1, num_epochs + 1):
@@ -414,8 +450,8 @@ def train_loop(data_loaders, model, fid_model, grapher, args):
                 test_loss = test_and_generate(epoch, model, fisher, loader, grapher)
                 break
 
-            generate(model, grapher, 'student') # generate student samples
-            generate(model, grapher, 'teacher') # generate teacher samples
+            generate(epoch, model, grapher, 'student') # generate student samples
+            generate(epoch, model, grapher, 'teacher') # generate teacher samples
 
         # evaluate and save away one-time metrics, these include:
         #    1. test elbo
@@ -424,7 +460,6 @@ def train_loop(data_loaders, model, fid_model, grapher, args):
         #    4. num synth + num true samples
         #    5. dump config to visdom
         check_or_create_dir(os.path.join(args.output_dir))
-        append_to_csv([test_loss['elbo_mean']], os.path.join(args.output_dir, "{}_test_elbo.csv".format(args.uid)))
         append_to_csv([test_loss['elbo_mean']], os.path.join(args.output_dir, "{}_test_elbo.csv".format(args.uid)))
         num_synth_samples = np.ceil(epoch * args.batch_size * model.ratio)
         num_true_samples = np.ceil(epoch * (args.batch_size - (args.batch_size * model.ratio)))
@@ -483,9 +518,14 @@ def train_loop(data_loaders, model, fid_model, grapher, args):
                 # so that we can have a separate visdom env
                 model.current_model += 1
 
-            grapher = Grapher(env=model.get_name(),
-                              server=args.visdom_url,
-                              port=args.visdom_port)
+            if args.visdom_url is not None:
+                grapher = Grapher('visdom',
+                                  env=model.get_name(),
+                                  server=args.visdom_url,
+                                  port=args.visdom_port)
+            else:
+                grapher = Grapher('tensorboard', comment=model.get_name())
+
 
 
 def _set_model_indices(model, grapher, idx, args):

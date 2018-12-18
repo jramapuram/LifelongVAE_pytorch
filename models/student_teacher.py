@@ -1,17 +1,19 @@
 from __future__ import print_function
 import os
+import warnings
 import torch
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributions as D
+import pyro.distributions as PD
 from torch.autograd import Variable
 from copy import deepcopy
 
 from helpers.distributions import nll
 from helpers.utils import expand_dims, long_type, squeeze_expand_dim, \
     ones_like, float_type, pad, inv_perm, one_hot_np, \
-    zero_pad_smaller_cat, check_or_create_dir
+    zero_pad_smaller_cat, check_or_create_dir, pca_smaller
 from models.vae.parallelly_reparameterized_vae import ParallellyReparameterizedVAE
 from models.vae.sequentially_reparameterized_vae import SequentiallyReparameterizedVAE
 
@@ -64,12 +66,41 @@ def kl_isotropic_gauss_gauss(dist_a, dist_b, rnd_perm, from_index=0):
     return torch.sum(D.kl_divergence(n0, n1), dim=-1)
 
 
+def kl_beta_beta(dist_a, dist_b, rnd_perm, from_index=0):
+    # invert the shuffle for the KL calculation
+    assert dist_a['conc1'].shape[1] == dist_b['conc1'].shape[1]
+    if rnd_perm is not None:
+        dist_a_conc1, dist_a_conc2 = [inv_perm(dist_a['conc1'], rnd_perm),
+                                      inv_perm(dist_a['conc2'], rnd_perm)]
+        dist_b_conc1, dist_b_conc2 = [inv_perm(dist_b['conc1'], rnd_perm),
+                                      inv_perm(dist_b['conc2'], rnd_perm)]
+    else:
+        dist_a_conc1, dist_a_conc2 = dist_a['conc1'], dist_a['conc2']
+        dist_b_conc1, dist_b_conc2 = dist_b['conc1'], dist_b['conc2']
+
+    # TODO: project to smaller space, PCA does not converge currently
+    # dist_a_conc1, dist_b_conc1 = pca_smaller(dist_a_conc1, dist_b_conc1)
+    # dist_a_conc2, dist_b_conc2 = pca_smaller(dist_a_conc2, dist_b_conc2)
+    # dist_a_conc1, dist_b_conc1 = zero_pad_smaller_cat(dist_a_conc1, dist_b_conc1)
+    # dist_a_conc2, dist_b_conc2 = zero_pad_smaller_cat(dist_a_conc2, dist_b_conc2)
+
+    # build distrs and reduce
+    da = PD.Beta(dist_a_conc1[from_index:], dist_a_conc2[from_index:])
+    db = PD.Beta(dist_b_conc1[from_index:], dist_b_conc2[from_index:])
+    return torch.sum(D.kl_divergence(da, db), dim=-1)
+
+
+
 def lazy_generate_modules(model, img_shp, batch_size, cuda):
     ''' Super hax, but needed for building lazy modules '''
     model.eval()
-    data = float_type(cuda)(batch_size, *img_shp).normal_()
+    #data = float_type(args.cuda)(args.batch_size, *img_shp).normal_()
+    data = float_type(next(model.parameters()).is_cuda)(batch_size, *img_shp).normal_()
     model(Variable(data))
 
+    # push toe model to cuda
+    if cuda and not next(model.parameters()).is_cuda:
+        model.cuda()
 
 class StudentTeacher(nn.Module):
     def __init__(self, initial_model, **kwargs):
@@ -129,10 +160,18 @@ class StudentTeacher(nn.Module):
                                               from_index=self.num_student_samples)
         elif 'gaussian' in q_z_given_x_s and 'gaussian' in q_z_given_x_t:
             # gauss kl-kl doesnt have any from-index
+            warnings.warn("posterior regularizer b/w gaussians is not tested")
             return kl_isotropic_gauss_gauss(q_z_given_x_s['gaussian'],
                                             q_z_given_x_t['gaussian'],
                                             self.rnd_perm, from_index=self.num_student_samples)
-            raise Exception("posterior regularizer b/w gaussians not supported")
+        elif 'beta' in q_z_given_x_s and 'beta' in q_z_given_x_t:
+            warnings.warn("posterior regularizer b/w betas not tested")
+            return kl_beta_beta(
+                q_z_given_x_s['beta'],
+                q_z_given_x_t['beta'],
+                self.rnd_perm,
+                from_index=self.num_student_samples
+            )
         else:
             raise NotImplementedError("unknown distribution requested for kl")
 
@@ -166,9 +205,15 @@ class StudentTeacher(nn.Module):
             p_x_given_z_s_logits = inv_perm(p_x_given_z_s_logits, self.rnd_perm)
             p_x_given_z_t_activated = inv_perm(p_x_given_z_t_activated, self.rnd_perm)
 
-        img_unrolled = int(np.prod(self.config['img_shp']))
-        p_x_given_z_s_logits = p_x_given_z_s_logits[self.num_student_samples:].view(-1, img_unrolled)
-        p_x_given_z_t_activated = p_x_given_z_t_activated[self.num_student_samples:].view(-1, img_unrolled)
+        # img_logits_unrolled = int(np.prod(p_x_given_z_s_logits.shape[1:]))
+        # img_activated_unrolled = int(np.prod(p_x_given_z_t_activated.shape[1:]))
+        # print("img_unrolled = ", img_unrolled, " | img_shp = ", self.config['img_shp'],
+        #       " | p_x_given_z_s_logits[self.num_student_samples:] = ",
+        #       p_x_given_z_s_logits[self.num_student_samples:].shape)
+        # p_x_given_z_s_logits = p_x_given_z_s_logits[self.num_student_samples:]\
+        #     .contiguous().view(-1, img_logits_unrolled)
+        # p_x_given_z_t_activated = p_x_given_z_t_activated[self.num_student_samples:]\
+        #     .contiguous().view(-1, img_activated_unrolled)
         # return torch.sum(D.kl_divergence(D.Bernoulli(logits=p_x_given_z_s_logits),
         #                                  D.Bernoulli(logits=p_x_given_z_s_logits)), -1)
         return nll(p_x_given_z_t_activated, p_x_given_z_s_logits, self.config['nll_type'])
@@ -189,16 +234,17 @@ class StudentTeacher(nn.Module):
                                         prepend=True)
 
             # add the likelihood regularizer and multiply it by the const
-            likelihood_regularizer = self.likelihood_regularizer(output_map['teacher']['x_reconstr'],
-                                                                 output_map['student']['x_reconstr_logits'])
-            likelihood_regularizer = pad(likelihood_regularizer,
-                                         diff,
-                                         dim=0,
-                                         prepend=True)
+            # likelihood_regularizer = self.likelihood_regularizer(output_map['teacher']['x_reconstr'],
+            #                                                      output_map['student']['x_reconstr_logits'])
+            # likelihood_regularizer = pad(likelihood_regularizer,
+            #                              diff,
+            #                              dim=0,
+            #                              prepend=True)
             if self.rnd_perm is not None: # re-shuffle
                 posterior_regularizer = posterior_regularizer[self.rnd_perm]
-                likelihood_regularizer = likelihood_regularizer[self.rnd_perm]
+                #likelihood_regularizer = likelihood_regularizer[self.rnd_perm]
 
+            likelihood_regularizer = 0.0
             posterior_regularizer = self.config['consistency_gamma'] * posterior_regularizer
             likelihood_regularizer = self.config['likelihood_gamma'] * likelihood_regularizer
             vae_loss['loss_mean'] = torch.mean(vae_loss['loss'] + likelihood_regularizer + posterior_regularizer)
@@ -278,7 +324,7 @@ class StudentTeacher(nn.Module):
         # copy the old student into the teacher
         # dont increase discrete dim for ewc
         config_copy = deepcopy(self.student.config)
-        config_copy['discrete_size'] += 0 if self.config['ewc_gamma'] > 0 else self.config['discrete_size']
+        #config_copy['discrete_size'] += 0 if self.config['ewc_gamma'] > 0 else self.config['discrete_size']
         self.teacher = deepcopy(self.student)
         del self.student
 
@@ -297,11 +343,13 @@ class StudentTeacher(nn.Module):
         else:
             raise Exception("unknown vae type requested")
 
-
         # forward pass once to build lazy modules
-        data = float_type(self.config['cuda'])(self.student.config['batch_size'],
-                                               *self.student.input_shape).normal_()
-        self.student(Variable(data))
+        #def lazy_generate_modules(model, img_shp, batch_size, cuda):
+        lazy_generate_modules(self.student, self.student.input_shape,
+                              self.student.config['batch_size'], self.config['cuda'])
+        # data = float_type(self.co'cuda'])(self.student.config['batch_size'],
+        #                                        *self.student.input_shape).normal_()
+        # self.student(Variable(data))
 
         # copy teacher params into student while
         # omitting the projection weights
@@ -317,34 +365,17 @@ class StudentTeacher(nn.Module):
               " | #student_samples: ", num_student_samples)
 
     def generate_synthetic_samples(self, model, batch_size, **kwargs):
-        z_samples = model.reparameterizer.prior(
-            batch_size, scale_var=self.config['generative_scale_var'], **kwargs
-        )
-        return model.nll_activation(model.generate(z_samples))
+        #model.eval()
+        with torch.no_grad():
+            return  model.generate_synthetic_samples(batch_size, **kwargs)
 
     def generate_synthetic_sequential_samples(self, model, num_rows=8):
-        assert model.has_discrete()
-
-        # create a grid of one-hot vectors for displaying in visdom
-        # uses one row for original dimension of discrete component
-        discrete_indices = np.array([np.random.randint(begin, end, size=num_rows) for begin, end in
-                                     zip(range(0, model.reparameterizer.config['discrete_size'],
-                                               self.config['discrete_size']),
-                                         range(self.config['discrete_size'],
-                                               model.reparameterizer.config['discrete_size'] + 1,
-                                               self.config['discrete_size']))])
-        discrete_indices = discrete_indices.reshape(-1)
+        #model.eval()
         with torch.no_grad():
-            z_samples = Variable(torch.from_numpy(one_hot_np(model.reparameterizer.config['discrete_size'],
-                                                             discrete_indices)))
-            z_samples = z_samples.type(float_type(self.config['cuda']))
-
-            if self.config['reparam_type'] == 'mixture' and self.config['vae_type'] != 'sequential':
-                ''' add in the gaussian prior '''
-                z_gauss = model.reparameterizer.gaussian.prior(z_samples.size(0))
-                z_samples = torch.cat([z_gauss, z_samples], dim=-1)
-
-            return model.nll_activation(model.generate(z_samples))
+            return model.generate_synthetic_sequential_samples(
+                num_original_discrete=self.config['discrete_size'],
+                num_rows=num_rows
+            )
 
     def _augment_data(self, x):
         ''' return batch_size worth of samples that are augmented

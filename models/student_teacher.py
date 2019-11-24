@@ -2,6 +2,7 @@ from __future__ import print_function
 import os
 import warnings
 import torch
+import functools
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,9 +14,8 @@ from copy import deepcopy
 from helpers.distributions import nll
 from helpers.utils import expand_dims, long_type, squeeze_expand_dim, \
     ones_like, float_type, pad, inv_perm, one_hot_np, \
-    zero_pad_smaller_cat, check_or_create_dir, pca_smaller
-from models.vae.parallelly_reparameterized_vae import ParallellyReparameterizedVAE
-from models.vae.sequentially_reparameterized_vae import SequentiallyReparameterizedVAE
+    zero_pad_smaller_cat, check_or_create_dir, pca_smaller, get_name
+from models.vae.simple_vae import SimpleVAE
 
 
 def detach_from_graph(param_map):
@@ -26,6 +26,45 @@ def detach_from_graph(param_map):
             v = v.detach_()
 
 
+def extract_synthetic_data_params(dist, rnd_perm=None, from_index=0):
+    """ Helper to invert a permutation and select items from from_index --> end.
+        Creates a new dict recursively and sets the items in that dict
+
+    :param dist: the dictionary of inputs
+    :param rnd_perm: the permutation vector
+    :param from_index: pick elements from_index till the end
+    :returns: new dict with inverted permutation and from_index --> end elems
+    :rtype: dict
+
+    """
+    dist_truncated = {}
+    for k, v in dist.items():
+        if isinstance(v, dict): # recurse
+            dist_truncated[k] = extract_synthetic_data_params(v, rnd_perm, from_index)
+        else:
+            if isinstance(v, torch.Tensor) and v.dim() > 1:
+                if rnd_perm is not None:
+                    dist_truncated[k] = inv_perm(v, rnd_perm)[from_index:].clone()
+                else:
+                    dist_truncated[k] = v[from_index:].clone()
+
+    return dist_truncated
+
+
+def zero_pad_smaller_distribution(dist_a, dist_b):
+    dist_a_padded, dist_b_padded = {}, {}
+    for (k1, v1), (k2, v2) in zip(dist_a.items(), dist_b.items()):
+        assert k1 == k2, "names dont match, error"
+        if isinstance(v1, dict) and isinstance(v2, dict): # recurse
+            dist_a_padded[k1], dist_b_padded[k2] = zero_pad_smaller_distribution(v1, v2)
+        else:
+            if isinstance(v1, torch.Tensor) and isinstance(v2, torch.Tensor) and v1.dim() > 1 and v2.dim() > 1:
+                tensor_a, tensor_b = zero_pad_smaller_cat(v1, v2)
+                dist_a_padded[k1] = tensor_a
+                dist_b_padded[k2] = tensor_b
+
+    return dist_a_padded, dist_b_padded
+
 def kl_categorical_categorical(dist_a, dist_b, rnd_perm, from_index=0):
     # invert the shuffle for the KL calculation
     if rnd_perm is not None:
@@ -34,21 +73,29 @@ def kl_categorical_categorical(dist_a, dist_b, rnd_perm, from_index=0):
     else:
         dist_a_logits, dist_b_logits = dist_a['logits'], dist_b['logits']
 
+    dist_a_logits, dist_b_logits = zero_pad_smaller_cat(dist_a_logits,
+                                                        dist_b_logits)
+    dist_a = D.OneHotCategorical(logits=dist_a_logits)
+    dist_b = D.OneHotCategorical(logits=dist_b_logits)
+
+    return D.kl_divergence(dist_a, dist_b)
+
+
     # https://github.com/tensorflow/tensorflow/blob/r1.1/tensorflow/contrib/distributions/python/ops/categorical.py
-    dist_a_log_softmax = F.log_softmax(dist_a_logits[from_index:], dim=-1)
-    dist_a_softmax = F.softmax(dist_a_logits[from_index:], dim=-1)
-    dist_b_log_softmax = F.log_softmax(dist_b_logits[from_index:], dim=-1)
+    # dist_a_log_softmax = F.log_softmax(dist_a_logits[from_index:], dim=-1)
+    # dist_a_softmax = F.softmax(dist_a_logits[from_index:], dim=-1)
+    # dist_b_log_softmax = F.log_softmax(dist_b_logits[from_index:], dim=-1)
 
-    # zero pad the smaller categorical
-    dist_a_log_softmax, dist_b_log_softmax \
-        = zero_pad_smaller_cat(dist_a_log_softmax,
-                               dist_b_log_softmax)
-    dist_a_softmax, dist_b_log_softmax \
-        = zero_pad_smaller_cat(dist_a_softmax,
-                               dist_b_log_softmax)
+    # # zero pad the smaller categorical
+    # dist_a_log_softmax, dist_b_log_softmax \
+    #     = zero_pad_smaller_cat(dist_a_log_softmax,
+    #                            dist_b_log_softmax)
+    # dist_a_softmax, dist_b_log_softmax \
+    #     = zero_pad_smaller_cat(dist_a_softmax,
+    #                            dist_b_log_softmax)
 
-    delta_log_probs1 = dist_a_log_softmax - dist_b_log_softmax
-    return torch.sum(dist_a_softmax * delta_log_probs1, dim=-1)
+    # delta_log_probs1 = dist_a_log_softmax - dist_b_log_softmax
+    # return torch.sum(dist_a_softmax * delta_log_probs1, dim=-1)
 
 
 def kl_isotropic_gauss_gauss(dist_a, dist_b, rnd_perm, from_index=0):
@@ -117,63 +164,84 @@ class StudentTeacher(nn.Module):
         # grab the meta config and print for
         self.config = kwargs['kwargs']
 
-    def load(self):
-        # load the model if it exists
-        if os.path.isdir(self.config['model_dir']):
-            model_filename = os.path.join(self.config['model_dir'], self.get_name() + ".th")
-            if os.path.isfile(model_filename):
-                print("loading existing student-teacher model: {}".format(model_filename))
-                lazy_generate_modules(self, self.student.input_shape,
-                                      self.config['batch_size'],
-                                      self.config['cuda'])
-                self.load_state_dict(torch.load(model_filename), strict=True)
-                return True
-            else:
-                print("{} does not exist...".format(model_filename))
+    # def load(self):
+    #     # load the model if it exists
+    #     if os.path.isdir(self.config['model_dir']):
+    #         model_filename = os.path.join(self.config['model_dir'], self.get_name() + ".th")
+    #         if os.path.isfile(model_filename):
+    #             print("loading existing student-teacher model: {}".format(model_filename))
+    #             lazy_generate_modules(self, self.student.input_shape,
+    #                                   self.config['batch_size'],
+    #                                   self.config['cuda'])
+    #             self.load_state_dict(torch.load(model_filename), strict=True)
+    #             return True
+    #         else:
+    #             print("{} does not exist...".format(model_filename))
 
-        return False
+    #     return False
 
-    def save(self, overwrite=False):
-        # save the model if it doesnt exist
-        check_or_create_dir(self.config['model_dir'])
-        model_filename = os.path.join(self.config['model_dir'], self.get_name() + ".th")
-        if not os.path.isfile(model_filename) or overwrite:
-            print("saving existing student-teacher model...")
-            torch.save(self.state_dict(), model_filename)
+    # def save(self, overwrite=False):
+    #     # save the model if it doesnt exist
+    #     check_or_create_dir(self.config['model_dir'])
+    #     model_filename = os.path.join(self.config['model_dir'], self.get_name() + ".th")
+    #     if not os.path.isfile(model_filename) or overwrite:
+    #         print("saving existing student-teacher model...")
+    #         torch.save(self.state_dict(), model_filename)
 
     def get_name(self):
-        return "{}{}_cg{}_s{}{}".format(
-            str(self.config['uid']),
-            str(self.current_model),
-            str(self.config['consistency_gamma']),
-            str(int(self.config['shuffle_minibatches'])),
-            self.student.get_name()
-        )
+        # return "{}{}_cg{}_s{}{}".format(
+        #     str(self.config['uid']),
+        #     str(self.current_model),
+        #     str(self.config['consistency_gamma']),
+        #     str(int(self.config['shuffle_minibatches'])),
+        #     self.student.get_name()
+        # )
+        return self.student.get_name()
 
     def posterior_regularizer_parallel(self, q_z_given_x_t, q_z_given_x_s):
         ''' Evaluates KL(Q_{\Phi})(z | \hat{x}) || Q_{\phi})(z | \hat{x})) '''
         # TF: kl = self.kl_categorical(p=self.q_z_s_given_x_t, q=self.q_z_t_given_x_t)
+        # if 'discrete' in q_z_given_x_s and 'discrete' in q_z_given_x_t:
+        #     return kl_categorical_categorical(q_z_given_x_s['discrete'],
+        #                                       q_z_given_x_t['discrete'],
+        #                                       self.rnd_perm,
+        #                                       from_index=self.num_student_samples)
+        # elif 'gaussian' in q_z_given_x_s and 'gaussian' in q_z_given_x_t:
+        #     # gauss kl-kl doesnt have any from-index
+        #     warnings.warn("posterior regularizer b/w gaussians is not tested")
+        #     return kl_isotropic_gauss_gauss(q_z_given_x_s['gaussian'],
+        #                                     q_z_given_x_t['gaussian'],
+        #                                     self.rnd_perm, from_index=self.num_student_samples)
+        # elif 'beta' in q_z_given_x_s and 'beta' in q_z_given_x_t:
+        #     warnings.warn("posterior regularizer b/w betas not tested")
+        #     return kl_beta_beta(
+        #         q_z_given_x_s['beta'],
+        #         q_z_given_x_t['beta'],
+        #         self.rnd_perm,
+        #         from_index=self.num_student_samples
+        #     )
+        # else:
+        #     raise NotImplementedError("unknown distribution requested for kl")
+        q_z_given_x_s = extract_synthetic_data_params(q_z_given_x_s, rnd_perm=self.rnd_perm,
+                                                      from_index=self.num_student_samples)
+        q_z_given_x_t = extract_synthetic_data_params(q_z_given_x_t, rnd_perm=self.rnd_perm,
+                                                      from_index=self.num_student_samples)
+         # print("[PRE] teacher = ", q_z_given_x_t['discrete']['logits'].shape, " | student = ",
+         #       q_z_given_x_s['discrete']['logits'].shape)
+        q_z_given_x_s, q_z_given_x_t = zero_pad_smaller_distribution(q_z_given_x_s, q_z_given_x_t)
+        # print("[POST] teacher = ", q_z_given_x_t['discrete']['logits'].shape, " | student = ",
+        #       q_z_given_x_s['discrete']['logits'].shape)
+
         if 'discrete' in q_z_given_x_s and 'discrete' in q_z_given_x_t:
-            return kl_categorical_categorical(q_z_given_x_s['discrete'],
-                                              q_z_given_x_t['discrete'],
-                                              self.rnd_perm,
-                                              from_index=self.num_student_samples)
-        elif 'gaussian' in q_z_given_x_s and 'gaussian' in q_z_given_x_t:
-            # gauss kl-kl doesnt have any from-index
-            warnings.warn("posterior regularizer b/w gaussians is not tested")
-            return kl_isotropic_gauss_gauss(q_z_given_x_s['gaussian'],
-                                            q_z_given_x_t['gaussian'],
-                                            self.rnd_perm, from_index=self.num_student_samples)
-        elif 'beta' in q_z_given_x_s and 'beta' in q_z_given_x_t:
-            warnings.warn("posterior regularizer b/w betas not tested")
-            return kl_beta_beta(
-                q_z_given_x_s['beta'],
-                q_z_given_x_t['beta'],
-                self.rnd_perm,
-                from_index=self.num_student_samples
+            kld = self.student.reparameterizer.discrete.kl(
+                {'discrete': q_z_given_x_s['discrete']},
+                {'discrete': q_z_given_x_t['discrete']}
             )
         else:
-            raise NotImplementedError("unknown distribution requested for kl")
+            kld = self.student.reparameterizer.kl(q_z_given_x_s, q_z_given_x_t)
+
+        # print("kld = ", kld.shape)
+        return kld
 
     def posterior_regularizer_sequential(self, q_z_given_x_t, q_z_given_x_s):
         ''' Evaluates KL(Q_{\Phi})(z | \hat{x}) || Q_{\phi})(z | \hat{x}))
@@ -200,10 +268,10 @@ class StudentTeacher(nn.Module):
         }
         return posterior_fn_map[self.config['vae_type']](q_z_given_x_t, q_z_given_x_s)
 
-    def likelihood_regularizer(self, p_x_given_z_t_activated, p_x_given_z_s_logits):
-        if self.rnd_perm is not None:
-            p_x_given_z_s_logits = inv_perm(p_x_given_z_s_logits, self.rnd_perm)
-            p_x_given_z_t_activated = inv_perm(p_x_given_z_t_activated, self.rnd_perm)
+    #def likelihood_regularizer(self, p_x_given_z_t_logits, p_x_given_z_s_logits):
+        # if self.rnd_perm is not None:
+        #     p_x_given_z_s_logits = inv_perm(p_x_given_z_s_logits, self.rnd_perm)
+        #     p_x_given_z_t_logits = inv_perm(p_x_given_z_t_logits, self.rnd_perm)
 
         # img_logits_unrolled = int(np.prod(p_x_given_z_s_logits.shape[1:]))
         # img_activated_unrolled = int(np.prod(p_x_given_z_t_activated.shape[1:]))
@@ -216,7 +284,17 @@ class StudentTeacher(nn.Module):
         #     .contiguous().view(-1, img_activated_unrolled)
         # return torch.sum(D.kl_divergence(D.Bernoulli(logits=p_x_given_z_s_logits),
         #                                  D.Bernoulli(logits=p_x_given_z_s_logits)), -1)
-        return nll(p_x_given_z_t_activated, p_x_given_z_s_logits, self.config['nll_type'])
+
+
+    def likelihood_regularizer(self, output_map):
+        # use activated for teacher because nll(Bern1, Bern2) requires Bern1 already activated
+        teacher_activated = extract_synthetic_data_params(output_map['teacher'],
+                                                          rnd_perm=self.rnd_perm,
+                                                          from_index=self.num_student_samples)['x_reconstr']
+        student_logits = extract_synthetic_data_params(output_map['student'],
+                                                       rnd_perm=self.rnd_perm,
+                                                       from_index=self.num_student_samples)['x_reconstr_logits']
+        return nll(teacher_activated, student_logits, self.config['nll_type'])
 
     def _lifelong_loss_function(self, output_map):
         ''' returns a combined loss of the VAE loss
@@ -224,6 +302,7 @@ class StudentTeacher(nn.Module):
         vae_loss = self.student.loss_function(output_map['student']['x_reconstr_logits'],
                                               output_map['augmented']['data'],
                                               output_map['student']['params'])
+
         if 'teacher' in output_map and not self.config['disable_regularizers']:
             posterior_regularizer = self.posterior_regularizer(output_map['teacher']['params'],
                                                                output_map['student']['params'])
@@ -234,20 +313,18 @@ class StudentTeacher(nn.Module):
                                         prepend=True)
 
             # add the likelihood regularizer and multiply it by the const
-            # likelihood_regularizer = self.likelihood_regularizer(output_map['teacher']['x_reconstr'],
-            #                                                      output_map['student']['x_reconstr_logits'])
-            # likelihood_regularizer = pad(likelihood_regularizer,
-            #                              diff,
-            #                              dim=0,
-            #                              prepend=True)
+            likelihood_regularizer = self.likelihood_regularizer(output_map)
+            likelihood_regularizer = pad(likelihood_regularizer,
+                                         diff,
+                                         dim=0,
+                                         prepend=True)
             if self.rnd_perm is not None: # re-shuffle
                 posterior_regularizer = posterior_regularizer[self.rnd_perm]
-                #likelihood_regularizer = likelihood_regularizer[self.rnd_perm]
+                likelihood_regularizer = likelihood_regularizer[self.rnd_perm]
 
-            likelihood_regularizer = 0.0
-            posterior_regularizer = self.config['consistency_gamma'] * posterior_regularizer
-            likelihood_regularizer = self.config['likelihood_gamma'] * likelihood_regularizer
-            vae_loss['loss_mean'] = torch.mean(vae_loss['loss'] + likelihood_regularizer + posterior_regularizer)
+            vae_loss['loss_mean'] = torch.mean(vae_loss['loss']
+                                               + self.config['likelihood_gamma'] * likelihood_regularizer
+                                               + self.config['consistency_gamma'] * posterior_regularizer)
             vae_loss['posterior_regularizer_mean'] = torch.mean(posterior_regularizer)
             vae_loss['likelihood_regularizer_mean'] = torch.mean(likelihood_regularizer)
 
@@ -294,6 +371,9 @@ class StudentTeacher(nn.Module):
 
         return self._lifelong_loss_function(output_map)
 
+    def importance_weighted_elbo(self, x):
+        return self.student.importance_weighted_elbo(x, K=5000)
+
     @staticmethod
     def disable_bn(module):
         for layer in module.children():
@@ -324,24 +404,23 @@ class StudentTeacher(nn.Module):
         # copy the old student into the teacher
         # dont increase discrete dim for ewc
         config_copy = deepcopy(self.student.config)
-        #config_copy['discrete_size'] += 0 if self.config['ewc_gamma'] > 0 else self.config['discrete_size']
+        config_copy['num_current_model'] = self.current_model + 1
+        config_copy['discrete_size'] += 0 if self.config['ewc_gamma'] > 0 else self.config['discrete_size']
         self.teacher = deepcopy(self.student)
         del self.student
 
         # create a new student
-        if self.config['vae_type'] == 'sequential':
-            self.student = SequentiallyReparameterizedVAE(input_shape=self.teacher.input_shape,
-                                                          num_current_model=self.current_model+1,
-                                                          reparameterizer_strs=self.teacher.reparameterizer_strs,
-                                                          **{'kwargs': config_copy}
-            )
-        elif self.config['vae_type'] == 'parallel':
-            self.student = ParallellyReparameterizedVAE(input_shape=self.teacher.input_shape,
-                                                        num_current_model=self.current_model+1,
-                                                        **{'kwargs': config_copy}
-            )
-        else:
-            raise Exception("unknown vae type requested")
+        self.student = SimpleVAE(
+            input_shape=self.teacher.input_shape,
+            **{'kwargs': config_copy}
+        )
+
+        class DictToArgs:
+            def __init__(self, **entries):
+                self.__dict__.update(entries)
+
+        self.student.get_name = functools.partial(get_name, args=DictToArgs(**config_copy))
+        print("student = ", self.student.get_name())
 
         # forward pass once to build lazy modules
         #def lazy_generate_modules(model, img_shp, batch_size, cuda):
@@ -353,8 +432,8 @@ class StudentTeacher(nn.Module):
 
         # copy teacher params into student while
         # omitting the projection weights
-        self.teacher, self.student \
-            = self.copy_model(self.teacher, self.student, disable_dst_grads=False)
+        # self.teacher, self.student \
+        #     = self.copy_model(self.teacher, self.student, disable_dst_grads=False)
 
         # update the current model's ratio
         self.current_model += 1
@@ -406,9 +485,10 @@ class StudentTeacher(nn.Module):
     def forward(self, x):
         x_augmented = self._augment_data(x).contiguous()
         x_recon_student, params_student = self.student(x_augmented)
-        x_reconstr_student_activated = self.student.nll_activation(x_recon_student)
-        _, q_z_given_xhat = self.student.posterior(x_reconstr_student_activated)
-        params_student['q_z_given_xhat'] = q_z_given_xhat
+        # x_reconstr_student_activated = self.student.nll_activation(x_recon_student)
+        # _, q_z_given_xhat = self.student.posterior(x_reconstr_student_activated)
+        # params_student['q_z_given_xhat'] = q_z_given_xhat
+        # print(list(params_student.keys()))
 
         ret_map = {
             'student':{

@@ -4,3 +4,6 @@
 [submodule "helpers"]
 	path = helpers
 	url = https://github.com/jramapuram/helpers
+[submodule "models/vae"]
+	path = models/vae
+	url = git+ssh://git@github.com/jramapuram/vae.git

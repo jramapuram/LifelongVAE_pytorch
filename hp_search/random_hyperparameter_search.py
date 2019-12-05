@@ -2,69 +2,98 @@
 
 from __future__ import print_function
 
+import os
 import argparse
 import numpy as np
 from subprocess import call
+from os.path import expanduser
 
-
-parser = argparse.ArgumentParser(description='LifeLong VAE MNIST HP Search')
+parser = argparse.ArgumentParser(description='LifelongVAE HP Search')
 parser.add_argument('--num-trials', type=int, default=50,
                     help="number of different models to run for the HP search (default: 50)")
-parser.add_argument('--num-titans', type=int, default=6,
-                    help="number of TitanXP's (default: 6)")
+parser.add_argument('--num-titans', type=int, default=15,
+                    help="number of TitanXP's (default: 15)")
 parser.add_argument('--num-pascals', type=int, default=15,
                     help="number of P100's (default: 15)")
+parser.add_argument('--singularity-img', type=str, default=None,
+                    help="if provided uses a singularity image (default: None)")
+parser.add_argument('--early-stop', action='store_true', default=False,
+                    help='enable early stopping (default: False)')
 args = parser.parse_args()
+
 
 
 def get_rand_hyperparameters():
     return {
-        'batch-size': 32,           # TODO: randomize to test these
+        'seed': 1234,
         'reparam-type': 'mixture',  # TODO: randomize to test these
-        'layer-type': 'conv',       # TODO: randomize to test these
-        'epochs': 500,                               # FIXED, but uses ES
-        'calculate-fid-with': 'inceptionv3',         # FIXED
-        'task': 'fashion',                            # FIXED
+        'epochs': 1000,                      # FIXED, but uses ES
+        'data-dir': '/home/ramapur0/datasets/binarized_mnist',
+        # 'calculate-fid-with': 'none',        # FIXED
+        'task': 'binarized_mnist',                     # FIXED
         'visdom-url': 'http://neuralnetworkart.com', # FIXED
-        'visdom-port': 8104,                         # FIXED
+        'visdom-port': 8098,                         # FIXED
+        'lr': np.random.choice([1e-5, 1e-4, 2e-4, 3e-4, 1e-3]),
+        'filter-depth': np.random.choice([8, 16, 32, 32, 32, 64, 128]),
+        'batch-size': np.random.choice([32, 64, 128, 256]),
+        'activation' :np.random.choice(['elu', 'selu', 'relu']),
+        # 'encoder-layer-type': np.random.choice(['conv', 'coordconv', 'dense', 'resnet']),
+        # 'decoder-layer-type': np.random.choice(['conv', 'coordconv', 'resnet', 'dense']),
+        'encoder-layer-type': np.random.choice(['dense']),
+        'decoder-layer-type': np.random.choice(['dense']),
         'shuffle-minibatches': np.random.choice([1, 0]),
-        'discrete-size': np.random.choice([1, 3, 5, 10]),
-        'continuous-size': np.random.choice([6, 8, 10, 20, 30, 40]),
-        'optimizer': np.random.choice(['adam', 'rmsprop', 'adamnorm']),
-        'continuous-mut-info': np.random.choice([1e-3, 1e-2, 0.1, 0.3, 0.5, 0.7, 1.0, 3.0, 5.0, 10.0]),
-        'discrete-mut-info': np.random.choice([1e-3, 1e-2, 0.1, 0.3, 0.5, 0.7, 1.0, 3.0, 5.0, 10.0]),
-        'use-pixel-cnn-decoder': np.random.choice([1, 0]),
+        'conv-normalization': np.random.choice(['batchnorm', 'groupnorm', 'weightnorm', 'none']),
+        'dense-normalization': np.random.choice(['batchnorm', 'weightnorm', 'none']),
+        'disable-gated': np.random.choice([1, 0]),
+        'discrete-size': np.random.choice([1]),
+        'continuous-size': np.random.choice([8, 10, 20, 30, 40, 64, 96, 128]),
+        'optimizer': np.random.choice(['adam', 'rmsprop']),
+        # 'continuous-mut-info': np.random.choice(list(np.linspace(0, 10)) + [0,0,0,0,0]),
+        # 'discrete-mut-info': np.random.choice(list(np.linspace(0, 10)) + [0,0,0,0,0]),
+        'continuous-mut-info': np.random.choice([1e-4, 1e-3, 2e-3, 1e-2, 0.1, 0.3, 0.9]),
+        'discrete-mut-info': np.random.choice([0.1, 0.2, 0.3, 0.5, 0.7, 1.0]),
         'monte-carlo-infogain': np.random.choice([1, 0]),
-        'consistency-gamma': np.random.choice([0.1, 0.5, 1.0, 3.0, 5.0, 10.0, 100.0]),
-        'kl-reg': np.random.choice([1.0, 1.1, 1.2, 1.3, 2.0, 3.0]),
-        'likelihood-gamma': np.random.choice([0.0, 0.0, 0.0, 1.0, 0.5, 0.2, 1.2, 1.5, 2.0]),
-        'generative-scale-var': np.random.choice([1.0, 1.01, 1.02, 1.03, 1.04, 1.05, 1.1]),
-        'mut-clamp-strategy': np.random.choice(['norm']), #TODO: randomize and test against clamp
-        'mut-clamp-value': np.random.choice([1, 2, 5, 10, 30, 50, 100])
+        # 'consistency-gamma': np.random.choice(np.linspace(0.1, 100, num=1000)),
+        'consistency-gamma': np.random.choice([0.1, 0.2, 0.3, 0.5, 0.7, 1.0, 1.1, 1.2, 1.3]),
+        'kl-beta': np.random.choice([0.2, 0.3, 0.5, 0.7, 1.0, 1.2, 1.4, 1.5, 1.6]),
+        # 'kl-beta': np.random.choice(list(np.linspace(0, 10)) + [1, 1, 1, 1]),
+        #'likelihood-gamma': np.random.choice([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.5, 0.2, 1.2, 1.5, 2.0]),
+        'likelihood-gamma': 0,
+        'generative-scale-var': np.random.choice([0.3, 0.6, 1.0]),
+        'mut-clamp-strategy': np.random.choice(['clamp']),
+        # 'mut-clamp-strategy': np.random.choice(['norm', 'clamp', 'none']), #TODO: randomize and test against clamp
+        #'mut-clamp-value': np.random.choice([1, 2, 5, 10, 30, 50, 100])
+        'mut-clamp-value': np.random.choice([100])
     }
 
 def format_job_str(job_map, run_str):
+    singularity_str = "" if args.singularity_img is None \
+        else "module load GCCcore/8.2.0 Singularity/3.4.0-Go-1.12 CUDA/10.0.130"
     return """#!/bin/bash -l
 
 #SBATCH --job-name={}
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=1
+#SBATCH --cpus-per-task=2
 #SBATCH --partition={}
 #SBATCH --time={}
-#SBATCH --gres=gpu:{}:1
-#SBATCH --mem=20000
+#SBATCH --gres=gpu:1
+#SBATCH --mem=32000
 #SBATCH --constraint="COMPUTE_CAPABILITY_6_0|COMPUTE_CAPABILITY_6_1"
-srun {}""".format(
-        job_map['job-name'],
-        job_map['partition'],
-        job_map['time'],
-        job_map['gpu'],
-        run_str
+echo $CUDA_VISIBLE_DEVICES
+{}
+srun --unbuffered {}""".format(
+    job_map['job-name'],
+    job_map['partition'],
+    job_map['time'],
+    singularity_str,
+    # job_map['gpu'],
+    run_str
 )
 
 def unroll_hp_and_value(hpmap):
     base_str = ""
-    no_value_keys = ["shuffle-minibatches", "use-pixel-cnn-decoder", "monte-carlo-infogain"]
+    no_value_keys = ["disable-gated", "use-pixel-cnn-decoder", "monte-carlo-infogain",
+                     "use-noisy-rnn-state", "use-prior-kl", "add-img-noise", "shuffle-minibatches"]
     for k, v in hpmap.items():
         if k in no_value_keys and v == 0:
             continue
@@ -75,21 +104,33 @@ def unroll_hp_and_value(hpmap):
         if k == "mut-clamp-value" and hpmap['mut-clamp-strategy'] != 'clamp':
             continue
 
+        if k == "normalization" and hpmap['layer-type'] == 'dense':
+            # only use BN or None for dense layers [GN doesnt make sense]
+            base_str += " --normalization={}".format(np.random.choice(['batchnorm', 'none']))
+            continue
+
         base_str += " --{}={}".format(k, v)
 
     return base_str
 
 def format_task_str(hp):
-    hpmap_str = unroll_hp_and_value(hp)
-    return """/home/ramapur0/.venv3/bin/python ../main.py --model-dir=.nonfidmodels
-    --early-stop {} --uid={}""".format(
+    hpmap_str = unroll_hp_and_value(hp) # --model-dir=.nonfidmodels
+    python_native = os.path.join(expanduser("~"), '.venv3/bin/python')
+    # python_bin = "singularity exec -B /home/ramapur0/opt:/opt --nv {} python".format(
+    python_bin = "singularity exec --nv {} python".format(
+        args.singularity_img) if args.singularity_img is not None else python_native
+    early_str = "--early-stop" if args.early_stop else ""
+    return """{} ../main.py {} {} --uid={}""".format(
+        python_bin,
+        early_str,
         hpmap_str,
-        "{}".format(hp['task']) + "_hp_search{}_"
+        "llHPv0{}_0"
     ).replace("\n", " ").replace("\r", "").replace("   ", " ").replace("  ", " ").strip()
 
 def get_job_map(idx, gpu_type):
     return {
-        'partition': 'shared-gpu',
+        #'partition': '\"shared-gpu,kalousis-gpu-EL7,cui-gpu,kruse-gpu\"',
+        'partition': 'shared-gpu-EL7',
         'time': '12:00:00',
         'gpu': gpu_type,
         'job-name': "hp_search{}".format(idx)
